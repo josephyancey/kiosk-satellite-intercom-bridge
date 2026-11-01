@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "intercom-bridge",
+  "name": "Intercom Bridge",
+  "version": "0.2.0",
+  "minAndroidSdk": 26,
+  "minAppVersion": "2026.10.45",
+  "entryClass": "dev.yancey.intercombridge.IntercomBridgePlugin",
+  "description": "Lets Kiosk Satellite kiosks and TECHO5 Echos call and announce to each other. Each Echo shows up in the kiosks' intercom list, and each kiosk in the Echos'. Install it on one kiosk or several: only one bridge runs on the network at a time, and another takes over when it stops. It also stands by while the intercom-bridge Docker container runs.",
+  "author": "Joseph Yancey",
+  "license": "MIT",
+  "capabilities": [],
+  "settings": [
+    {
+      "key": "intercomKey",
+      "type": "secret",
+      "title": "Kiosk Satellite intercom key",
+      "default": "",
+      "group": "Connection",
+      "description": "The fleet's intercom key, from Settings > Intercom on any kiosk."
+    },
+    {
+      "key": "houseWord",
+      "type": "secret",
+      "title": "TECHO5 house word",
+      "default": "",
+      "group": "Connection",
+      "description": "The house word set on the TECHO5 devices, under Sound & Voice."
+    },
+    {
+      "key": "nameSuffix",
+      "type": "string",
+      "title": "Echo name suffix",
+      "default": "",
+      "group": "Calls",
+      "description": "Added to each Echo's name in the kiosks' intercom list, such as \" (Echo)\". Empty shows the name as it is."
+    },
+    {
+      "key": "silenceHangup",
+      "type": "number",
+      "title": "Hang up after silence",
+      "default": 0,
+      "min": 0,
+      "max": 300,
+      "step": 5,
+      "unit": "s",
+      "group": "Calls",
+      "description": "End a call once neither side has spoken for this long. 0 leaves calls up however quiet they are."
+    },
+    {
+      "key": "quietLevel",
+      "type": "number",
+      "title": "Silence level",
+      "default": -55,
+      "min": -80,
+      "max": -20,
+      "step": 1,
+      "unit": "dBFS",
+      "group": "Calls",
+      "description": "Sound below this counts as silence for the hang up."
+    },
+    {
+      "key": "gainToEcho",
+      "type": "number",
+      "title": "Volume to Echos",
+      "default": 0,
+      "min": -20,
+      "max": 20,
+      "step": 1,
+      "unit": "dB",
+      "group": "Calls",
+      "description": "Makes kiosks louder or quieter on the Echos."
+    },
+    {
+      "key": "gainToKiosk",
+      "type": "number",
+      "title": "Volume to kiosks",
+      "default": 0,
+      "min": -20,
+      "max": 20,
+      "step": 1,
+      "unit": "dB",
+      "group": "Calls",
+      "description": "Makes Echos louder or quieter on the kiosks."
+    },
+    {
+      "key": "advertiseAddress",
+      "type": "string",
+      "title": "This kiosk's address",
+      "default": "",
+      "group": "Network",
+      "description": "The IPv4 address kiosks and Echos reach this kiosk on. Empty finds it."
+    },
+    {
+      "key": "statusPort",
+      "type": "number",
+      "input": "field",
+      "title": "Status port",
+      "default": 8790,
+      "min": 1024,
+      "max": 65535,
+      "step": 1,
+      "group": "Network",
+      "description": "Serves /status, which other bridges check before they stand by."
+    },
+    {
+      "key": "portLow",
+      "type": "number",
+      "input": "field",
+      "title": "First stand-in port",
+      "default": 41000,
+      "min": 1024,
+      "max": 65535,
+      "step": 1,
+      "group": "Network",
+      "description": "Each kiosk and Echo gets a stand-in on a port from this range."
+    },
+    {
+      "key": "portHigh",
+      "type": "number",
+      "input": "field",
+      "title": "Last stand-in port",
+      "default": 41099,
+      "min": 1024,
+      "max": 65535,
+      "step": 1,
+      "group": "Network"
+    }
+  ],
+  "commands": []
+}
