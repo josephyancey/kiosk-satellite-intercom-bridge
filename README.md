@@ -2,9 +2,7 @@
 
 A [Kiosk Satellite](https://github.com/jxlarrea/kiosk-satellite) plugin that lets Kiosk Satellite
 kiosks and [TECHO5](https://github.com/HuskerMinion/techo5) Echos call and announce to each other.
-
-It is the [intercom-bridge](https://github.com/josephyancey/intercom-bridge) Docker container,
-running inside a kiosk instead, so there is no server to keep up.
+It runs inside a kiosk, so there is no server to keep up.
 
 ## What it does
 
@@ -20,9 +18,9 @@ running inside a kiosk instead, so there is no server to keep up.
 ## One bridge at a time
 
 Only one bridge runs on the network at a time. The one running advertises itself over mDNS, and
-any other copy stands by: this plugin on another kiosk, or the Docker container. When the running
-one stops, because its kiosk restarted or lost its network, a standby takes over within about a
-minute. So you can install it on two or three kiosks, or keep the container as a spare.
+the copies on other kiosks stand by. When the running one stops, because its kiosk restarted or
+lost its network, a standby takes over within about a minute. So you can install it on two or
+three kiosks, or on the whole fleet.
 
 ## Set up
 
