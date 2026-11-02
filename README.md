@@ -22,11 +22,27 @@ the copies on other kiosks stand by. When the running one stops, because its kio
 lost its network, a standby takes over within about a minute. So you can install it on two or
 three kiosks, or on the whole fleet.
 
+## Installation
+
+### Community Plugins (Recommended)
+
+Intercom Bridge is listed in [Community Plugins](https://kiosksatellite.com/plugins/). Use the button below to open it in your Kiosk Satellite and install it.
+
+[![Install in Kiosk Satellite](https://kiosksatellite.com/img/badges/plugin-add.svg)](https://kiosksatellite.com/redirect/plugin/?repository=josephyancey/intercom-bridge-plugin)
+
+Or search for `Intercom Bridge` in **Settings > Plugin Manager > Browse plugins** in Kiosk Satellite.
+
+### Manual
+
+1. Open **Settings > Plugin Manager** in Kiosk Satellite and turn on **Enable Plugins**.
+2. Choose **Add plugin**, paste `https://github.com/josephyancey/intercom-bridge-plugin` and choose **Preview**.
+3. Review the plugin and choose **Trust and install**.
+
 ## Set up
 
 1. On the TECHO5 devices, set a house word under **Sound & Voice**.
-2. Install the plugin on a kiosk that stays on: **Settings > Plugin Manager > Add plugin**, with
-   this repository's address.
+2. Install the plugin on a kiosk that stays on. On a fleet leader, add it to a fleet profile to
+   give every follower a standby copy.
 3. Open the plugin and enter the **Kiosk Satellite intercom key** (from **Settings > Intercom**) and
    the **TECHO5 house word**, then enable it.
 
@@ -63,6 +79,15 @@ the protocol [Kiosk Phone](https://github.com/mpjanofsky/kiosk-phone) documented
 Satellite code is used.
 
 The plugin needs no special capabilities. It reaches Android's mDNS service through the app.
+
+## Where data goes
+
+Nothing leaves your network. The plugin talks only to the kiosks and TECHO5 devices it finds over
+mDNS, and to other copies of itself. Call audio and announcements pass through it between those
+devices, encrypted on the TECHO5 side and sent as Kiosk Satellite's own intercom sends them on the
+kiosk side; it records nothing. The intercom key and house word stay on the kiosk. The status page
+on port 8790 has no password and lists the devices found, their addresses and calls in progress,
+to anyone on the network.
 
 ## Building
 
