@@ -9,14 +9,15 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -27,6 +28,11 @@ import java.util.concurrent.TimeUnit;
  */
 final class Bridge {
     static final String KIOSK_SERVICE = "_kiosk-satellite._tcp", ECHO_SERVICE = "_techo5._tcp";
+    /**
+     * In the TXT record of every stand-in, so a bridge never takes another bridge's stand-in for a real
+     * device. Two bridges running at once would otherwise mirror each other's stand-ins without end.
+     */
+    static final String STANDIN_TXT = "standin";
     private static final long RING_MS = T5Link.RING_MS; // an Echo rings this long; a kiosk caller is told "missed" after it
     private static final long SOCKET_WAIT_MS = 10000; // after an answer, how long the kiosk has to open the audio socket
     private static final long ANNOUNCE_LISTEN_MS = 25000; // the most a kiosk's broadcast is gathered for
@@ -53,11 +59,13 @@ final class Bridge {
     static final class Kiosk {
         String id, name, version, address;
         int adminPort;
+        boolean standin; // a bridge's stand-in for an Echo, by its TXT record
     }
 
     static final class Echo {
         String name, address;
         int port;
+        boolean standin; // a bridge's stand-in for a kiosk, by its TXT record
     }
 
     /** A real kiosk and the stand-in TECHO5 device the Echos call it through. */
@@ -110,6 +118,7 @@ final class Bridge {
     private final Map<String, EchoTwin> echos = new HashMap<>(); // by the Echo's name, lower case
     private final Map<String, Session> calls = new HashMap<>();
     private Map<String, Long> ports = new HashMap<>(); // "ks:<id>" and "t5:<name>" to port, kept in stateFile
+    private Set<String> kioskHosts = Collections.emptySet(); // every address a kiosk service was found on, in the last look
     private String lastErr = "";
     private long lastAt;
 
@@ -130,19 +139,20 @@ final class Bridge {
         return Crypto.hex(Crypto.sha256("intercom-bridge:" + echoName.toLowerCase(Locale.ROOT))).substring(0, 16);
     }
 
-    /** Looks once for kiosks and Echos, and brings the stand-ins up to date. */
+    /**
+     * Looks once for kiosks, then for Echos, and brings the stand-ins up to date. One look at a time:
+     * Android caps how many mDNS requests an app has going.
+     */
     void scan() throws InterruptedException {
-        Future<List<Mdns.Service>> k = pool.submit(() -> mdns.browse(KIOSK_SERVICE, cfg.browseForMs));
-        Future<List<Mdns.Service>> e = pool.submit(() -> mdns.browse(ECHO_SERVICE, cfg.browseForMs));
         try {
-            setKiosks(kiosksFrom(k.get()));
-        } catch (java.util.concurrent.ExecutionException x) {
-            fail("looking for kiosks: " + x.getCause().getMessage());
+            setKiosks(kiosksFrom(mdns.browse(KIOSK_SERVICE, cfg.browseForMs)));
+        } catch (IOException x) {
+            fail("looking for kiosks: " + x.getMessage());
         }
         try {
-            setEchos(echosFrom(e.get()));
-        } catch (java.util.concurrent.ExecutionException x) {
-            fail("looking for Echos: " + x.getCause().getMessage());
+            setEchos(echosFrom(mdns.browse(ECHO_SERVICE, cfg.browseForMs)));
+        } catch (IOException x) {
+            fail("looking for Echos: " + x.getMessage());
         }
         forget(System.currentTimeMillis() - cfg.forgetAfterMs);
     }
@@ -159,6 +169,7 @@ final class Bridge {
             seen.add(k.id);
             k.name = s.txt("name");
             k.version = s.txt("version");
+            k.standin = !s.txt(STANDIN_TXT).isEmpty();
             try {
                 k.adminPort = Integer.parseInt(s.txt("port"));
             } catch (NumberFormatException x) {
@@ -177,6 +188,7 @@ final class Bridge {
             e.name = s.txt("name").isEmpty() ? s.instance : s.txt("name");
             e.address = s.address;
             e.port = s.port;
+            e.standin = !s.txt(STANDIN_TXT).isEmpty();
             String key = e.name.toLowerCase(Locale.ROOT);
             if (e.name.isEmpty() || e.address == null || e.address.isEmpty() || "0".equals(s.txt("hears")) || seen.contains(key)) continue;
             seen.add(key);
@@ -189,11 +201,16 @@ final class Bridge {
         return s.matches("\\d{1,3}(\\.\\d{1,3}){3}");
     }
 
-    /** Takes in the kiosks one look found. Stand-ins of our own are left out. */
+    /** Takes in the kiosks one look found. Stand-ins, ours or another bridge's, are left out. */
     void setKiosks(List<Kiosk> found) {
         long now = System.currentTimeMillis();
+        Set<String> hosts = new HashSet<>();
+        for (Kiosk k : found) hosts.add(k.address);
+        synchronized (this) {
+            kioskHosts = hosts;
+        }
         for (Kiosk k : found) {
-            if (isOwnStandin(k.id)) continue;
+            if (isStandin(k, cfg.nameSuffix)) continue;
             KioskTwin t;
             synchronized (this) {
                 t = kiosks.get(k.id);
@@ -213,11 +230,11 @@ final class Bridge {
         }
     }
 
-    /** Takes in the Echos one look found. Stand-ins of our own are left out. */
+    /** Takes in the Echos one look found. Stand-ins, ours or another bridge's, are left out. */
     void setEchos(List<Echo> found) {
         long now = System.currentTimeMillis();
         for (Echo e : found) {
-            if (e.address.equals(cfg.advertise) && e.port >= cfg.portLow && e.port <= cfg.portHigh) continue; // one of ours
+            if (isStandin(e)) continue;
             EchoTwin t;
             synchronized (this) {
                 t = echos.get(e.name.toLowerCase(Locale.ROOT));
@@ -235,8 +252,25 @@ final class Bridge {
         }
     }
 
-    private synchronized boolean isOwnStandin(String id) {
-        for (EchoTwin t : echos.values()) if (t.id.equals(id)) return true;
+    /**
+     * Whether a kiosk is a bridge's stand-in for an Echo. Bridges before 1.0.2 put no mark on their
+     * stand-ins, but gave each the id {@link #standinId} makes from the Echo's name.
+     */
+    static boolean isStandin(Kiosk k, String suffix) {
+        if (k.standin || k.id.equals(standinId(k.name))) return true;
+        return !suffix.isEmpty() && k.name.endsWith(suffix)
+                && k.id.equals(standinId(k.name.substring(0, k.name.length() - suffix.length())));
+    }
+
+    /**
+     * Whether an Echo is a bridge's stand-in for a kiosk: marked so, or, from a bridge before 1.0.2,
+     * served from the stand-in ports or from an address a kiosk is on. A real Echo never shares an
+     * address with a kiosk.
+     */
+    private synchronized boolean isStandin(Echo e) {
+        if (e.standin || e.port >= cfg.portLow && e.port <= cfg.portHigh) return true;
+        if (e.address.equals(cfg.advertise) || kioskHosts.contains(e.address)) return true;
+        for (KioskTwin t : kiosks.values()) if (t.k.address.equals(e.address)) return true;
         return false;
     }
 
@@ -264,6 +298,7 @@ final class Bridge {
     private Closeable advertiseEcho(String name, int port) throws IOException {
         Map<String, String> txt = new LinkedHashMap<>();
         txt.put("name", name);
+        txt.put(STANDIN_TXT, "1");
         return mdns.advertise(label(name), ECHO_SERVICE, port, txt);
     }
 
@@ -294,6 +329,7 @@ final class Bridge {
             txt.put("version", cfg.version);
             txt.put("port", Integer.toString(t.port));
             txt.put("host", cfg.advertise);
+            txt.put(STANDIN_TXT, "1");
             try {
                 t.adv = mdns.advertise("ks-" + t.id, KIOSK_SERVICE, t.port, txt);
             } catch (IOException x) {

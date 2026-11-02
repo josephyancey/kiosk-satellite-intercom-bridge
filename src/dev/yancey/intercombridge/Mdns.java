@@ -2,6 +2,7 @@ package dev.yancey.intercombridge;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -30,4 +31,14 @@ interface Mdns {
 
     /** Advertises a service on this device until the result is closed. */
     Closeable advertise(String instance, String type, int port, Map<String, String> txt) throws IOException;
+
+    /** Whether the last look for type resolved every service it found, so an empty result means none. */
+    default boolean lastLookComplete(String type) {
+        return true;
+    }
+
+    /** How the looks went, for the status page. */
+    default Map<String, Object> diagnostics() {
+        return Collections.emptyMap();
+    }
 }

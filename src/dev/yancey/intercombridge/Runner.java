@@ -49,6 +49,9 @@ final class Runner {
     private volatile long since;
     private volatile boolean stopped;
     private String standingBy = "";
+    private static final int DOUBTFUL_ROUNDS = 10; // about five minutes of rounds
+    private int clearRounds; // rounds in a row that clearly found no running bridge, while standing by
+    private int quietRounds; // rounds in a row that found no running bridge, in doubt or not
 
     Runner(Bridge.Config cfg, Mdns mdns, ExecutorService pool, Bridge.Log log, Listener listener, String id, int statusPort, long everyMs) {
         this.cfg = cfg;
@@ -103,13 +106,28 @@ final class Runner {
         if (s != null) s.close();
     }
 
-    /** One round: look for other bridges, decide, and, while running, look for devices. */
+    /**
+     * One round: look for other bridges, decide, and, while running, look for devices. A standby takes
+     * over after two rounds in a row clearly found no bridge running. A look that failed, left a bridge
+     * unresolved or could not reach one's status page is in doubt, since one missed answer must not
+     * start a second bridge beside the running one; only DOUBTFUL_ROUNDS of those in a row, with no
+     * bridge seen running, let it take over anyway, for a running bridge that went without a goodbye.
+     */
     void round() throws InterruptedException {
-        List<Other> others = others();
+        Look look = others();
+        List<Other> others = look.running;
         if (bridge == null) {
-            if (others.isEmpty()) {
-                standUp();
+            if (!others.isEmpty()) {
+                clearRounds = quietRounds = 0;
             } else {
+                clearRounds = look.doubtful ? 0 : clearRounds + 1;
+                quietRounds++;
+                if (clearRounds < 2 && quietRounds < DOUBTFUL_ROUNDS) return;
+                if (clearRounds < 2) log.info("No bridge has answered as running for " + quietRounds + " rounds; this one takes over");
+                clearRounds = quietRounds = 0;
+                standUp();
+            }
+            if (!others.isEmpty()) {
                 Other o = others.get(0);
                 if (!o.address.equals(standingBy)) log.info("Another bridge runs at " + o.address + "; this one stands by");
                 standingBy = o.address;
@@ -135,16 +153,24 @@ final class Runner {
                 + (b.callCount() > 0 ? ", " + b.callCount() + " in a call" : "") + (err.isEmpty() ? "" : ". Last problem: " + err));
     }
 
-    /** The other bridges that answer that they are running. */
-    private List<Other> others() throws InterruptedException {
-        List<Other> out = new ArrayList<>();
+    /** What one look for other bridges found. */
+    static final class Look {
+        final List<Other> running = new ArrayList<>();
+        boolean doubtful; // the look failed, or a bridge it found could not be resolved or reached
+    }
+
+    /** The other bridges that answer that they are running, and whether the look was in doubt. */
+    private Look others() throws InterruptedException {
+        Look out = new Look();
         List<Mdns.Service> found;
         try {
             found = mdns.browse(BRIDGE_SERVICE, cfg.browseForMs);
         } catch (IOException e) {
             log.warn("Looking for other bridges: " + e.getMessage());
+            out.doubtful = true;
             return out;
         }
+        out.doubtful = !mdns.lastLookComplete(BRIDGE_SERVICE);
         for (Mdns.Service s : found) {
             if (s.txt("id").equals(id) || s.txt("id").isEmpty()) continue;
             // mDNS can remember a bridge that has gone; its status page is the word that it still runs.
@@ -157,9 +183,10 @@ final class Runner {
                 byte[] got = Crypto.unhex(Json.str(m, "proof"));
                 if (r.status == 200 && Json.bool(m, "active") && otherId.equals(s.txt("id"))
                         && got != null && MessageDigest.isEqual(got, proof(otherId, true, otherSince, nonce))) {
-                    out.add(new Other(otherId, s.address, otherSince));
+                    out.running.add(new Other(otherId, s.address, otherSince));
                 }
-            } catch (IOException ignored) {
+            } catch (IOException e) {
+                out.doubtful = true; // gone, or only slow to answer
             }
         }
         return out;
@@ -209,6 +236,8 @@ final class Runner {
         if (!nonce.isEmpty() && nonce.length() <= 64) m.put("proof", Crypto.hex(proof(id, b != null, at, nonce)));
         if (b != null) m.putAll(b.status());
         else m.put("version", cfg.version);
+        Map<String, Object> looks = mdns.diagnostics();
+        if (!looks.isEmpty()) m.put("mdns", looks);
         r.json(200, m);
     }
 

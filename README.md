@@ -26,7 +26,7 @@ Or search for `Intercom Bridge` in **Settings > Plugin Manager > Browse plugins*
 2. Turn off intercom encryption (TLS) under **Intercom** on the kiosks. The bridge does not speak it yet.
 3. Enable the plugin on a kiosk that stays on and enter the **Kiosk Satellite intercom key** (from **Settings > Intercom**) and the **TECHO5 house word**. Within a minute the status line shows the kiosks and Echos it found, and the Remote Admin Overview has an **Intercom bridge** tile.
 
-Only one bridge runs on the network at a time, so it is safe to install it on several kiosks: the others stand by, and one takes over within about a minute if the running one goes away. With a fleet, install it on the leader and add it to the profile's **Plugins** row, with **Plugin secrets** on under the profile's Credentials so the key and house word go along too. Leave **This kiosk's address** empty there, so each kiosk finds its own.
+Only one bridge runs on the network at a time, so it is safe to install it on several kiosks: the others stand by, and one takes over within a minute or two if the running one goes away. With a fleet, install it on the leader and add it to the profile's **Plugins** row, with **Plugin secrets** on under the profile's Credentials so the key and house word go along too. Leave **This kiosk's address** empty there, so each kiosk finds its own.
 
 ## Settings
 
@@ -43,17 +43,17 @@ Only one bridge runs on the network at a time, so it is safe to install it on se
 | Status port | Serves `/status`, which other bridges check before they stand by. 8790 unless you change it |
 | First / last stand-in port | Each kiosk and Echo gets a stand-in on one of these ports, 41000 to 41099 |
 
-`http://<kiosk>:8790/status` shows whether this copy is the one running, what it found and the calls in progress.
+`http://<kiosk>:8790/status` shows whether this copy is the one running, what it found, how its last mDNS looks went and the calls in progress.
 
 ## How it works
 
-Every Echo gets a stand-in kiosk, advertised over mDNS on this kiosk's address with its own port, which the kiosks list and call. Every kiosk gets a stand-in TECHO5 device the same way. A call to a stand-in becomes a call to the real device, and the bridge carries the audio between them, converting Kiosk Satellite's 80 ms frames to TECHO5's 20 ms ones.
+Every Echo gets a stand-in kiosk, advertised over mDNS on this kiosk's address with its own port, which the kiosks list and call. Every kiosk gets a stand-in TECHO5 device the same way. A call to a stand-in becomes a call to the real device, and the bridge carries the audio between them, converting Kiosk Satellite's 80 ms frames to TECHO5's 20 ms ones. Each stand-in is marked as one in its mDNS record, so a bridge never stands in for another bridge's stand-ins. Version 1.0.2 also knows the unmarked stand-ins of earlier versions, but those earlier versions do not know the mark, so update every copy.
 
 - The TECHO5 side uses the same Noise handshake the devices do (Noise_NNpsk0_25519_ChaChaPoly_SHA256, keyed by the house word).
 - The Kiosk Satellite side follows the intercom protocol [Kiosk Phone](https://github.com/mpjanofsky/kiosk-phone) documented. No Kiosk Satellite code is used.
-- The running bridge advertises `_intercom-bridge._tcp`. A copy that finds one alive stands by and looks again every 30 seconds. If two run at once, the one that started first stays.
+- The running bridge advertises `_intercom-bridge._tcp`. A copy that finds one alive stands by and looks again every 30 seconds. It takes over after two looks in a row clearly found none running. A look in doubt, one that failed or found a bridge it could not reach, never counts as clear, so a missed answer does not start a second bridge; only about five minutes of such looks, for a bridge that went without saying goodbye, let it take over. If two run at once anyway, the one that started first stays.
 
-The plugin needs no capabilities. It reaches Android's mDNS service through the app's context.
+The plugin needs no capabilities. It reaches Android's mDNS service through the app's context, with mDNS clients of its own where Android allows, so its lookups do not hold up Kiosk Satellite's. The status page says when it had to use the app's own.
 
 Nothing leaves your network. The plugin talks only to the kiosks and Echos it finds and to other copies of itself. Call audio and announcements pass through it without being recorded, and the key and house word stay on the kiosk.
 

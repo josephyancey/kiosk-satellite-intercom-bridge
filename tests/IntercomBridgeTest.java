@@ -41,7 +41,10 @@ public final class IntercomBridgeTest {
         kioskCallsEcho();
         echoCallsKiosk();
         echoAnnouncesToKiosk();
+        twoBridgesDoNotMirror();
+        oldBridgeStandins();
         oneBridgeAtATime();
+        failedLookStandsBy();
         hostileInput();
         forgedBridge();
         System.out.println("IntercomBridgeTest: all passed");
@@ -241,8 +244,9 @@ public final class IntercomBridgeTest {
         }
     }
 
-    /** A TECHO5 device that answers calls and takes announcements. */
+    /** A TECHO5 device that answers calls and takes announcements, on an address of its own as a real one is. */
     static final class FakeEcho {
+        static final String ADDRESS = "127.0.0.2";
         final String name = "Gen2 Echo";
         final Http.Server srv;
         final BlockingQueue<Object> inbox = new LinkedBlockingQueue<>();
@@ -250,7 +254,7 @@ public final class IntercomBridgeTest {
         final T5Announce ann = new T5Announce(WORD);
 
         FakeEcho() throws IOException {
-            srv = new Http.Server("127.0.0.1", 0, this::serve, pool, Http.BODY_MOST);
+            srv = new Http.Server(ADDRESS, 0, this::serve, pool, Http.BODY_MOST);
         }
 
         void serve(Http.Request r) throws IOException {
@@ -267,10 +271,10 @@ public final class IntercomBridgeTest {
             got.add(a.link);
         }
 
-        void advertise(FakeMdns m) throws IOException {
+        void advertise() throws IOException {
             Map<String, String> txt = new LinkedHashMap<>();
             txt.put("name", name);
-            m.advertise("gen2-echo", Bridge.ECHO_SERVICE, srv.port(), txt);
+            new FakeMdns(ADDRESS).advertise("gen2-echo", Bridge.ECHO_SERVICE, srv.port(), txt);
         }
     }
 
@@ -310,7 +314,7 @@ public final class IntercomBridgeTest {
         FakeKiosk kiosk = new FakeKiosk();
         FakeEcho echo = new FakeEcho();
         kiosk.advertise(net);
-        echo.advertise(net);
+        echo.advertise();
         Bridge b = new Bridge(config(), net, pool, QUIET);
         b.scan();
         check(b.kioskCount() == 1 && b.echoCount() == 1, "the bridge found both");
@@ -354,7 +358,7 @@ public final class IntercomBridgeTest {
         FakeKiosk kiosk = new FakeKiosk();
         FakeEcho echo = new FakeEcho();
         kiosk.advertise(net);
-        echo.advertise(net);
+        echo.advertise();
         Bridge b = new Bridge(config(), net, pool, QUIET);
         b.scan();
         Mdns.Service standin = null;
@@ -392,7 +396,7 @@ public final class IntercomBridgeTest {
         kiosk.answer = "listening";
         FakeEcho echo = new FakeEcho();
         kiosk.advertise(net);
-        echo.advertise(net);
+        echo.advertise();
         Bridge b = new Bridge(config(), net, pool, QUIET);
         b.scan();
         Mdns.Service standin = null;
@@ -424,7 +428,153 @@ public final class IntercomBridgeTest {
         System.out.println("Echo announces ok");
     }
 
+    // ---- stand-ins ----
+
+    /** How many services of type are advertised under name. */
+    static int named(String type, String name) {
+        int n = 0;
+        for (Object[] a : FakeMdns.ads) {
+            @SuppressWarnings("unchecked") Map<String, String> txt = (Map<String, String>) a[4];
+            if (a[1].equals(type) && name.equals(txt.get("name"))) n++;
+        }
+        return n;
+    }
+
+    /**
+     * Two bridges running at once, one on the kiosk and one on another device, each see the other's
+     * stand-ins. Before 1.0.2 each took those for real devices and stood in for them in turn, so every
+     * kiosk showed up twice in the kiosks' list and calls by name failed as ambiguous.
+     */
+    static void twoBridgesDoNotMirror() throws Exception {
+        FakeMdns.ads.clear();
+        FakeKiosk kiosk = new FakeKiosk();
+        FakeEcho echo = new FakeEcho();
+        kiosk.advertise(new FakeMdns("127.0.0.1"));
+        echo.advertise();
+        Bridge.Config ca = config(), cb = config();
+        cb.advertise = cb.listen = "127.0.0.3";
+        cb.portLow = ca.portHigh + 1;
+        cb.portHigh = cb.portLow + 9;
+        Bridge a = new Bridge(ca, new FakeMdns(ca.advertise), pool, QUIET);
+        Bridge b = new Bridge(cb, new FakeMdns(cb.advertise), pool, QUIET);
+        for (int i = 0; i < 3; i++) {
+            a.scan();
+            b.scan();
+        }
+        check(a.kioskCount() == 1 && a.echoCount() == 1, "the first bridge stands in for the real devices only: "
+                + a.kioskCount() + " kiosks, " + a.echoCount() + " Echos");
+        check(b.kioskCount() == 1 && b.echoCount() == 1, "so does the second: " + b.kioskCount() + " kiosks, " + b.echoCount() + " Echos");
+        check(named(Bridge.KIOSK_SERVICE, "Office Tablet") == 1, "the kiosk is listed once among the kiosks");
+        check(named(Bridge.ECHO_SERVICE, "Gen2 Echo") == 1, "the Echo is listed once among the Echos");
+        check(named(Bridge.KIOSK_SERVICE, "Gen2 Echo") == 2 && named(Bridge.ECHO_SERVICE, "Office Tablet") == 2,
+                "each bridge stands in for each real device");
+        Map<String, Object> st = a.status();
+        check(((List<?>) st.get("kiosks")).size() == 1 && ((List<?>) st.get("echos")).size() == 1, "the status page agrees");
+        a.close();
+        b.close();
+        kiosk.srv.close();
+        echo.srv.close();
+        System.out.println("two bridges do not mirror ok");
+    }
+
+    /** Stand-ins left by a bridge before 1.0.2 carry no mark, and are still known for what they are. */
+    static void oldBridgeStandins() throws Exception {
+        FakeMdns.ads.clear();
+        FakeKiosk kiosk = new FakeKiosk();
+        FakeEcho echo = new FakeEcho();
+        kiosk.advertise(new FakeMdns("127.0.0.1"));
+        echo.advertise();
+        FakeMdns old = new FakeMdns("127.0.0.3");
+        // Its stand-in kiosk for the Echo, named with a suffix, and its stand-in Echo for the kiosk on a
+        // port outside this bridge's range.
+        Map<String, String> k = new LinkedHashMap<>();
+        k.put("id", Bridge.standinId("Gen2 Echo"));
+        k.put("name", "Gen2 Echo (Echo)");
+        k.put("version", "1.0.1");
+        k.put("port", "41006");
+        old.advertise("ks-" + k.get("id"), Bridge.KIOSK_SERVICE, 41006, k);
+        Map<String, String> e = new LinkedHashMap<>();
+        e.put("name", "Office Tablet");
+        old.advertise("office-tablet", Bridge.ECHO_SERVICE, 1234, e);
+        Bridge.Config c = config();
+        c.nameSuffix = " (Echo)";
+        // Each rule on its own: a marked Echo on an address no kiosk is on and off the stand-in ports, an
+        // unmarked one known only by the stand-in ports, and a marked kiosk whose id says nothing.
+        Map<String, String> marked = new LinkedHashMap<>();
+        marked.put("name", "Marked Echo");
+        marked.put(Bridge.STANDIN_TXT, "1");
+        new FakeMdns("127.0.0.4").advertise("marked-echo", Bridge.ECHO_SERVICE, 1234, marked);
+        Map<String, String> ranged = new LinkedHashMap<>();
+        ranged.put("name", "Ranged Echo");
+        new FakeMdns("127.0.0.5").advertise("ranged-echo", Bridge.ECHO_SERVICE, c.portLow + 5, ranged);
+        Map<String, String> mk = new LinkedHashMap<>();
+        mk.put("id", "feedfacefeedface");
+        mk.put("name", "Marked Kiosk");
+        mk.put("port", "1234");
+        mk.put(Bridge.STANDIN_TXT, "1");
+        new FakeMdns("127.0.0.6").advertise("ks-feedfacefeedface", Bridge.KIOSK_SERVICE, 1234, mk);
+        Bridge b = new Bridge(c, new FakeMdns("127.0.0.1"), pool, QUIET);
+        b.scan();
+        check(b.kioskCount() == 1 && b.echoCount() == 1, "an older bridge's stand-ins are not stood in for: "
+                + b.kioskCount() + " kiosks, " + b.echoCount() + " Echos");
+        check(named(Bridge.KIOSK_SERVICE, "Office Tablet") == 1, "the kiosk is still listed once");
+        b.close();
+        kiosk.srv.close();
+        echo.srv.close();
+        System.out.println("older bridges' stand-ins ok");
+    }
+
     // ---- one bridge ----
+
+    /**
+     * A look for other bridges that fails, or finds one it cannot resolve, says nothing about them, so a
+     * standby stays standing by; only a long run of such looks lets it take over. Rounds are run one by
+     * one here, so the count is exact.
+     */
+    static void failedLookStandsBy() throws Exception {
+        String[] mode = {"fails"}; // fails, unresolved or clear
+        FakeMdns net = new FakeMdns("127.0.0.1");
+        Mdns flaky = new Mdns() {
+            @Override public List<Service> browse(String type, long lookMs) throws IOException {
+                if (type.equals(Runner.BRIDGE_SERVICE)) {
+                    if (mode[0].equals("fails")) throw new IOException("look failed");
+                    return new ArrayList<>(); // as if the running bridge's record did not resolve
+                }
+                return net.browse(type, lookMs);
+            }
+            @Override public boolean lastLookComplete(String type) {
+                return !type.equals(Runner.BRIDGE_SERVICE) || mode[0].equals("clear");
+            }
+            @Override public Closeable advertise(String instance, String type, int port, Map<String, String> txt) {
+                return net.advertise(instance, type, port, txt);
+            }
+        };
+        Runner.Listener quiet = (level, text) -> {};
+        for (String m : new String[] {"fails", "unresolved"}) {
+            FakeMdns.ads.clear();
+            mode[0] = m;
+            Runner r = new Runner(config(), flaky, pool, QUIET, quiet, "dddddddddddddddd", 0, 50);
+            for (int i = 0; i < 9; i++) r.round();
+            check(!r.active(), "nine rounds whose look " + m + " do not start a bridge");
+            r.round();
+            check(r.active(), "the tenth does, for a bridge gone without a goodbye");
+            r.stop();
+        }
+        FakeMdns.ads.clear();
+        mode[0] = "clear";
+        Runner r = new Runner(config(), flaky, pool, QUIET, quiet, "dddddddddddddddd", 0, 50);
+        r.round();
+        check(!r.active(), "one clear round is not enough");
+        mode[0] = "unresolved";
+        r.round();
+        mode[0] = "clear";
+        r.round();
+        check(!r.active(), "a round in doubt starts the count of clear ones over");
+        r.round();
+        check(r.active(), "two clear rounds in a row start the bridge");
+        r.stop();
+        System.out.println("failed look stands by ok");
+    }
 
     static void oneBridgeAtATime() throws Exception {
         FakeMdns.ads.clear();

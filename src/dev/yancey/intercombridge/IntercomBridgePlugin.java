@@ -24,12 +24,13 @@ import me.jxl.kiosk.plugins.PluginHost;
  * the network at a time, and another takes over when it stops.
  */
 public final class IntercomBridgePlugin implements KioskPlugin {
-    static final String VERSION = "1.0.1";
+    static final String VERSION = "1.0.2";
     private static final long EVERY_MS = 30000;
 
     private PluginHost host;
     private ExecutorService pool;
     private Runner runner;
+    private NsdMdns mdns;
     private Thread thread;
     private Map<String, Object> running; // the settings the runner was started with
 
@@ -90,7 +91,8 @@ public final class IntercomBridgePlugin implements KioskPlugin {
             @Override public void info(String m) { say(m); }
             @Override public void warn(String m) { say(m); }
         };
-        runner = new Runner(cfg, new NsdMdns(context), pool, log, this::report, bridgeId(dir),
+        mdns = new NsdMdns(context);
+        runner = new Runner(cfg, mdns, pool, log, this::report, bridgeId(dir),
                 (int) num(settings, "statusPort", 8790), EVERY_MS);
         report("", "Looking for another bridge");
         thread = daemons.newThread(runner::run);
@@ -121,9 +123,11 @@ public final class IntercomBridgePlugin implements KioskPlugin {
             Thread.currentThread().interrupt();
         }
         pool.shutdownNow();
+        mdns.close();
         runner = null;
         thread = null;
         pool = null;
+        mdns = null;
     }
 
     private void report(String level, String text) {
