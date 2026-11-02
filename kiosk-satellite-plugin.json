@@ -3,7 +3,7 @@
   "apiVersion": 1,
   "id": "intercom-bridge",
   "name": "Intercom Bridge",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAndroidSdk": 26,
   "minAppVersion": "2026.10.45",
   "entryClass": "dev.yancey.intercombridge.IntercomBridgePlugin",
