@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicReference;
 /** {@link Mdns} through Android's NsdManager, which shares the system's mDNS responder with every app. */
 final class NsdMdns implements Mdns {
     private static final int RESOLVE_MS = 3000;
+    private static final int START_MS = 1000; // how long a browse has to say it started or failed
+    private static final int RETRIES = 3; // tries again after Android's per-app limit turns one away
     private final NsdManager nsd;
     private final Object resolving = new Object(); // older Androids resolve one service at a time
 
@@ -29,24 +31,35 @@ final class NsdMdns implements Mdns {
     @Override
     public List<Service> browse(String type, long lookMs) throws IOException, InterruptedException {
         List<NsdServiceInfo> found = new ArrayList<>();
-        AtomicInteger failed = new AtomicInteger();
-        NsdManager.DiscoveryListener l = new NsdManager.DiscoveryListener() {
-            @Override public void onStartDiscoveryFailed(String t, int code) { failed.set(code == 0 ? -1 : code); }
-            @Override public void onStopDiscoveryFailed(String t, int code) {}
-            @Override public void onDiscoveryStarted(String t) {}
-            @Override public void onDiscoveryStopped(String t) {}
-            @Override public void onServiceFound(NsdServiceInfo info) { synchronized (found) { found.add(info); } }
-            @Override public void onServiceLost(NsdServiceInfo info) {}
-        };
-        nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l);
-        try {
-            Thread.sleep(lookMs);
-        } finally {
-            if (failed.get() == 0) {
-                try { nsd.stopServiceDiscovery(l); } catch (IllegalArgumentException ignored) {}
+        // Android caps how many browses and resolves an app has going, and this plugin shares the
+        // cap with Kiosk Satellite's own, so a browse turned away for that waits and tries again.
+        for (int attempt = 0; ; attempt++) {
+            AtomicInteger failed = new AtomicInteger();
+            CountDownLatch started = new CountDownLatch(1);
+            NsdManager.DiscoveryListener l = new NsdManager.DiscoveryListener() {
+                @Override public void onStartDiscoveryFailed(String t, int code) { failed.set(code == 0 ? -1 : code); started.countDown(); }
+                @Override public void onStopDiscoveryFailed(String t, int code) {}
+                @Override public void onDiscoveryStarted(String t) { started.countDown(); }
+                @Override public void onDiscoveryStopped(String t) {}
+                @Override public void onServiceFound(NsdServiceInfo info) { synchronized (found) { found.add(info); } }
+                @Override public void onServiceLost(NsdServiceInfo info) {}
+            };
+            nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l);
+            started.await(START_MS, TimeUnit.MILLISECONDS);
+            if (failed.get() == NsdManager.FAILURE_MAX_LIMIT && attempt < RETRIES) {
+                backOff(attempt);
+                continue;
             }
+            try {
+                if (failed.get() == 0) Thread.sleep(lookMs);
+            } finally {
+                if (failed.get() == 0) {
+                    try { nsd.stopServiceDiscovery(l); } catch (IllegalArgumentException ignored) {}
+                }
+            }
+            if (failed.get() != 0) throw new IOException("mDNS browse for " + type + " failed (" + failed.get() + ")");
+            break;
         }
-        if (failed.get() != 0) throw new IOException("mDNS browse for " + type + " failed (" + failed.get() + ")");
         List<NsdServiceInfo> seen;
         synchronized (found) {
             seen = new ArrayList<>(found);
@@ -71,6 +84,7 @@ final class NsdMdns implements Mdns {
 
     private NsdServiceInfo resolve(NsdServiceInfo info) throws InterruptedException {
         synchronized (resolving) {
+            int full = 0;
             for (int attempt = 0; attempt < 5; attempt++) {
                 CountDownLatch done = new CountDownLatch(1);
                 AtomicReference<NsdServiceInfo> got = new AtomicReference<>();
@@ -81,11 +95,22 @@ final class NsdMdns implements Mdns {
                 });
                 if (!done.await(RESOLVE_MS, TimeUnit.MILLISECONDS)) return null;
                 if (got.get() != null) return got.get();
-                if (code.get() != NsdManager.FAILURE_ALREADY_ACTIVE) return null;
-                Thread.sleep(200); // someone else in this app is resolving
+                if (code.get() == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                    Thread.sleep(200); // someone else in this app is resolving
+                } else if (code.get() == NsdManager.FAILURE_MAX_LIMIT && full < RETRIES) {
+                    backOff(full++);
+                } else {
+                    return null;
+                }
             }
             return null;
         }
+    }
+
+    /** Waits about 1, 2, then 4 seconds, staggered so the kiosk's own lookups get a turn. */
+    private static void backOff(int attempt) throws InterruptedException {
+        long ms = 1000L << attempt;
+        Thread.sleep(ms + (long) (Math.random() * ms / 2));
     }
 
     @Override
