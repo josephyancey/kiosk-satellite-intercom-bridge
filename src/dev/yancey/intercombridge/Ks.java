@@ -51,20 +51,30 @@ final class Ks {
             return payload + "." + sign(payload);
         }
 
-        /** Whether token was signed with the key, is for call, is unexpired and unused. One that passes is spent. */
-        boolean verify(String token, String call) {
+        /** The claims of a token signed with the key and unexpired, or null. Nothing is spent. */
+        Map<String, Object> signed(String token) {
             int dot = token.indexOf('.');
-            if (dot < 0) return false;
+            if (dot < 0) return null;
             String payload = token.substring(0, dot);
-            if (!MessageDigest.isEqual(token.substring(dot + 1).getBytes(StandardCharsets.UTF_8), sign(payload).getBytes(StandardCharsets.UTF_8))) return false;
+            if (!MessageDigest.isEqual(token.substring(dot + 1).getBytes(StandardCharsets.UTF_8), sign(payload).getBytes(StandardCharsets.UTF_8))) return null;
             Map<String, Object> claims;
             try {
                 claims = Json.object(Base64.getUrlDecoder().decode(payload));
             } catch (IllegalArgumentException e) {
-                return false;
+                return null;
             }
+            return Json.num(claims, "exp") < System.currentTimeMillis() ? null : claims;
+        }
+
+        /** Whether token was signed with the key, is for call, is unexpired and unused. One that passes is spent. */
+        boolean verify(String token, String call) {
+            return spend(token, signed(token), call);
+        }
+
+        /** Like verify, for a token whose claims signed already returned. */
+        boolean spend(String token, Map<String, Object> claims, String call) {
+            if (claims == null || !call.equals(Json.str(claims, "intercom"))) return false;
             long exp = Json.num(claims, "exp"), now = System.currentTimeMillis();
-            if (!call.equals(Json.str(claims, "intercom")) || exp < now) return false;
             synchronized (seen) {
                 for (Iterator<Long> it = seen.values().iterator(); it.hasNext(); ) if (it.next() < now) it.remove();
                 if (seen.containsKey(token)) return false;
@@ -199,14 +209,21 @@ final class Ks {
                 m.put("key", auth.keyDigest()); m.put("dnd", false); m.put("endpoint", ep);
                 r.json(200, m);
             } else if (r.method.equals("POST") && p.equals("/api/intercom/call")) {
+                Map<String, Object> out = new LinkedHashMap<>();
+                String token = bearer(r);
+                Map<String, Object> claims = auth.signed(token);
+                if (claims == null) { // before the body is parsed
+                    out.put("status", "key");
+                    r.json(403, out);
+                    return;
+                }
                 Map<String, Object> req = Json.object(r.body);
                 String call = Json.str(req, "call");
                 Peer from = Peer.from(Json.obj(req, "from"));
-                Map<String, Object> out = new LinkedHashMap<>();
                 if (call.isEmpty() || from.id.isEmpty()) {
                     out.put("error", "call and from required");
                     r.json(400, out);
-                } else if (!auth.verify(bearer(r), call)) {
+                } else if (!auth.spend(token, claims, call)) {
                     out.put("status", "key");
                     r.json(403, out);
                 } else if (from.tls) {
@@ -218,10 +235,12 @@ final class Ks {
                 }
             } else if (r.method.equals("POST") && p.startsWith("/api/intercom/call/")) {
                 String call = Http.unescape(p.substring("/api/intercom/call/".length()));
-                String action = Json.str(Json.object(r.body), "action");
-                if (!auth.verify(bearer(r), call)) {
+                if (!auth.verify(bearer(r), call)) { // before the body is parsed
                     r.json(403, new LinkedHashMap<String, Object>());
-                } else if (action.isEmpty()) {
+                    return;
+                }
+                String action = Json.str(Json.object(r.body), "action");
+                if (action.isEmpty()) {
                     r.json(400, new LinkedHashMap<String, Object>());
                 } else if (!calls.signal(call, action)) {
                     r.json(404, new LinkedHashMap<String, Object>());

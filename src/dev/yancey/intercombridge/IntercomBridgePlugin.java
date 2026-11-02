@@ -24,7 +24,7 @@ import me.jxl.kiosk.plugins.PluginHost;
  * the network at a time, and another takes over when it stops.
  */
 public final class IntercomBridgePlugin implements KioskPlugin {
-    static final String VERSION = "1.0.0";
+    static final String VERSION = "1.0.1";
     private static final long EVERY_MS = 30000;
 
     private PluginHost host;
@@ -80,6 +80,9 @@ public final class IntercomBridgePlugin implements KioskPlugin {
         ThreadFactory daemons = r -> {
             Thread t = new Thread(r, "intercom-bridge-" + n.incrementAndGet());
             t.setDaemon(true);
+            // The plugin runs in Kiosk Satellite's process, where an uncaught exception ends the app.
+            // Whatever slips past the bridge's own handling ends only its thread.
+            t.setUncaughtExceptionHandler((th, e) -> say("A bridge thread stopped: " + e));
             return t;
         };
         pool = Executors.newCachedThreadPool(daemons);

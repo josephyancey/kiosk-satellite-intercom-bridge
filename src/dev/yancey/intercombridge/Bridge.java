@@ -244,7 +244,8 @@ final class Bridge {
         KioskTwin t = new KioskTwin();
         t.k = k;
         t.seen = now;
-        t.srv = listen("ks:" + k.id, r -> serveEchoCall(t, r));
+        // An announcement's voice, with room to spare: T5Announce cuts a longer one to twenty seconds.
+        t.srv = listen("ks:" + k.id, r -> serveEchoCall(t, r), T5Announce.MAX_BYTES + Http.SMALL_BODY);
         t.port = t.srv.port();
         if (!cfg.noAdvertise) {
             try {
@@ -283,7 +284,8 @@ final class Bridge {
         t.name = e.name + cfg.nameSuffix;
         t.seen = now;
         int[] port = new int[1];
-        t.srv = listen("t5:" + e.name.toLowerCase(Locale.ROOT), Ks.standin(t.id, t.name, cfg.version, port, auth, new StandinCalls(t)));
+        t.srv = listen("t5:" + e.name.toLowerCase(Locale.ROOT), Ks.standin(t.id, t.name, cfg.version, port, auth, new StandinCalls(t)),
+                Http.SMALL_BODY);
         t.port = port[0] = t.srv.port();
         if (!cfg.noAdvertise) {
             Map<String, String> txt = new LinkedHashMap<>();
@@ -344,8 +346,8 @@ final class Bridge {
         try { c.close(); } catch (IOException | RuntimeException ignored) {}
     }
 
-    /** Serves the port kept for key, or the first free one in the range, and remembers it. */
-    private Http.Server listen(String key, Http.Handler h) throws IOException {
+    /** Serves the port kept for key, or the first free one in the range, and remembers it. Bodies over bodyMost are refused. */
+    private Http.Server listen(String key, Http.Handler h, int bodyMost) throws IOException {
         Long want;
         List<Long> taken = new ArrayList<>();
         synchronized (this) {
@@ -354,7 +356,7 @@ final class Bridge {
         }
         if (want != null) {
             try {
-                return new Http.Server(cfg.listen, want.intValue(), h, pool);
+                return new Http.Server(cfg.listen, want.intValue(), h, pool, bodyMost);
             } catch (IOException ignored) {
             }
         }
@@ -362,7 +364,7 @@ final class Bridge {
             if (taken.contains((long) port) || want != null && port == want) continue;
             Http.Server s;
             try {
-                s = new Http.Server(cfg.listen, port, h, pool);
+                s = new Http.Server(cfg.listen, port, h, pool, bodyMost);
             } catch (IOException e) {
                 continue;
             }

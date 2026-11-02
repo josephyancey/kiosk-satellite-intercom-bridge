@@ -44,7 +44,11 @@ final class NsdMdns implements Mdns {
                 @Override public void onServiceFound(NsdServiceInfo info) { synchronized (found) { found.add(info); } }
                 @Override public void onServiceLost(NsdServiceInfo info) {}
             };
-            nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l);
+            try {
+                nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l);
+            } catch (RuntimeException e) {
+                throw new IOException("mDNS browse for " + type + ": " + e.getMessage());
+            }
             started.await(START_MS, TimeUnit.MILLISECONDS);
             if (failed.get() == NsdManager.FAILURE_MAX_LIMIT && attempt < RETRIES) {
                 backOff(attempt);
@@ -89,10 +93,14 @@ final class NsdMdns implements Mdns {
                 CountDownLatch done = new CountDownLatch(1);
                 AtomicReference<NsdServiceInfo> got = new AtomicReference<>();
                 AtomicInteger code = new AtomicInteger();
-                nsd.resolveService(info, new NsdManager.ResolveListener() {
-                    @Override public void onResolveFailed(NsdServiceInfo i, int c) { code.set(c); done.countDown(); }
-                    @Override public void onServiceResolved(NsdServiceInfo i) { got.set(i); done.countDown(); }
-                });
+                try {
+                    nsd.resolveService(info, new NsdManager.ResolveListener() {
+                        @Override public void onResolveFailed(NsdServiceInfo i, int c) { code.set(c); done.countDown(); }
+                        @Override public void onServiceResolved(NsdServiceInfo i) { got.set(i); done.countDown(); }
+                    });
+                } catch (RuntimeException e) {
+                    return null;
+                }
                 if (!done.await(RESOLVE_MS, TimeUnit.MILLISECONDS)) return null;
                 if (got.get() != null) return got.get();
                 if (code.get() == NsdManager.FAILURE_ALREADY_ACTIVE) {
@@ -116,10 +124,15 @@ final class NsdMdns implements Mdns {
     @Override
     public Closeable advertise(String instance, String type, int port, Map<String, String> txt) throws IOException {
         NsdServiceInfo info = new NsdServiceInfo();
-        info.setServiceName(instance);
-        info.setServiceType(type);
-        info.setPort(port);
-        for (Map.Entry<String, String> e : txt.entrySet()) info.setAttribute(e.getKey(), e.getValue());
+        try {
+            info.setServiceName(instance);
+            info.setServiceType(type);
+            info.setPort(port);
+            // A name heard from the network can be too long or not UTF-8, and Android throws for that.
+            for (Map.Entry<String, String> e : txt.entrySet()) info.setAttribute(e.getKey(), e.getValue());
+        } catch (RuntimeException e) {
+            throw new IOException("mDNS advertising " + instance + ": " + e.getMessage());
+        }
         CountDownLatch done = new CountDownLatch(1);
         AtomicInteger failed = new AtomicInteger();
         NsdManager.RegistrationListener l = new NsdManager.RegistrationListener() {
@@ -128,7 +141,11 @@ final class NsdMdns implements Mdns {
             @Override public void onServiceRegistered(NsdServiceInfo i) { done.countDown(); }
             @Override public void onServiceUnregistered(NsdServiceInfo i) {}
         };
-        nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l);
+        try {
+            nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l);
+        } catch (RuntimeException e) {
+            throw new IOException("mDNS advertising " + instance + ": " + e.getMessage());
+        }
         try {
             done.await(RESOLVE_MS, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {

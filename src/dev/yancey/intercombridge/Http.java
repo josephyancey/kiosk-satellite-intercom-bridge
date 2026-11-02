@@ -2,6 +2,7 @@ package dev.yancey.intercombridge;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,6 +17,9 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Just enough HTTP/1.1 for the intercoms: a server whose handlers may take the connection over for
@@ -26,6 +30,39 @@ final class Http {
 
     private static final int HEAD_MOST = 16 << 10;
     static final int BODY_MOST = 2 << 20; // a 20 s announcement is 640 KB
+    /** The most a JSON request needs. A bigger body waits for one of the BIG_BODIES permits. */
+    static final int SMALL_BODY = 64 << 10;
+
+    // Everything below is read before the sender is checked, so it is bounded: a host on the network
+    // with no key must not be able to fill a small device's memory or threads.
+    private static final Semaphore BIG_BODIES = new Semaphore(2);
+    private static final Semaphore CONNECTIONS = new Semaphore(128); // across every port
+    private static final int PORT_CONNECTIONS = 16;
+    /** How long a request, or the wait for the next one on a kept-alive connection, may take in all. */
+    private static final long REQUEST_MOST_MS = 20000;
+
+    /** Ends a request that runs past its deadline, however slowly its bytes trickle in. */
+    private static final class Deadline extends FilterInputStream {
+        private volatile long started;
+        private volatile boolean on;
+
+        Deadline(InputStream in) { super(in); }
+
+        void start() {
+            started = System.nanoTime();
+            on = true;
+        }
+
+        void off() { on = false; }
+
+        private void check() throws IOException {
+            if (on && System.nanoTime() - started > REQUEST_MOST_MS * 1_000_000L) throw new IOException("a request too slow");
+        }
+
+        @Override public int read() throws IOException { check(); return super.read(); }
+
+        @Override public int read(byte[] b, int off, int len) throws IOException { check(); return super.read(b, off, len); }
+    }
 
     static final class Request {
         String method, path, query = "";
@@ -47,6 +84,14 @@ final class Http {
                 if (eq > 0 && unescape(kv.substring(0, eq)).equals(name)) return unescape(kv.substring(eq + 1));
             }
             return "";
+        }
+
+        /**
+         * Says the peer has proved itself, so the connection it took over may outlast the deadline
+         * every request has until then: a call runs as long as it lasts.
+         */
+        void trusted() {
+            if (in instanceof Deadline) ((Deadline) in).off();
         }
 
         String remoteHost() {
@@ -145,18 +190,28 @@ final class Http {
         return b;
     }
 
-    /** A server on one port. Each connection gets a thread from pool. */
+    /**
+     * A server on one port. Each connection gets a thread from pool, up to PORT_CONNECTIONS on the
+     * port and CONNECTIONS in all; more are closed at once. Request bodies over bodyMost are refused.
+     */
     static final class Server {
         private final ServerSocket ss;
         private final Handler handler;
         private final ExecutorService pool;
+        private final int bodyMost;
+        private final Semaphore open = new Semaphore(PORT_CONNECTIONS);
 
         Server(String listen, int port, Handler handler, ExecutorService pool) throws IOException {
+            this(listen, port, handler, pool, SMALL_BODY);
+        }
+
+        Server(String listen, int port, Handler handler, ExecutorService pool, int bodyMost) throws IOException {
             ss = new ServerSocket();
             ss.setReuseAddress(true);
             ss.bind(listen == null || listen.isEmpty() ? new InetSocketAddress(port) : new InetSocketAddress(listen, port));
             this.handler = handler;
             this.pool = pool;
+            this.bodyMost = Math.min(bodyMost, BODY_MOST);
             pool.execute(this::accept);
         }
 
@@ -166,22 +221,53 @@ final class Http {
 
         private void accept() {
             while (!ss.isClosed()) {
+                Socket s;
                 try {
-                    Socket s = ss.accept();
-                    pool.execute(() -> serve(s));
-                } catch (IOException | java.util.concurrent.RejectedExecutionException e) {
+                    s = ss.accept();
+                } catch (IOException e) {
+                    if (ss.isClosed()) return;
+                    continue;
+                }
+                if (!open.tryAcquire()) {
+                    closeQuietly(s);
+                    continue;
+                }
+                if (!CONNECTIONS.tryAcquire()) {
+                    open.release();
+                    closeQuietly(s);
+                    continue;
+                }
+                try {
+                    pool.execute(() -> {
+                        try {
+                            serve(s);
+                        } finally {
+                            CONNECTIONS.release();
+                            open.release();
+                        }
+                    });
+                } catch (RejectedExecutionException e) {
+                    CONNECTIONS.release();
+                    open.release();
+                    closeQuietly(s);
                     if (ss.isClosed()) return;
                 }
             }
         }
 
+        private static void closeQuietly(Socket s) {
+            try { s.close(); } catch (IOException ignored) {}
+        }
+
         private void serve(Socket s) {
             boolean taken = false;
+            boolean big = false;
             try {
                 s.setSoTimeout(15000);
-                InputStream in = new BufferedInputStream(s.getInputStream());
+                Deadline in = new Deadline(new BufferedInputStream(s.getInputStream()));
                 OutputStream out = s.getOutputStream();
                 while (true) {
+                    in.start();
                     String line = readLine(in);
                     if (line == null) return;
                     String[] parts = line.split(" ");
@@ -195,24 +281,36 @@ final class Http {
                     String len = r.header("content-length");
                     if (!len.isEmpty()) {
                         int n = Integer.parseInt(len);
-                        if (n < 0 || n > BODY_MOST) return;
+                        if (n < 0 || n > bodyMost) return;
+                        if (n > SMALL_BODY) {
+                            if (!BIG_BODIES.tryAcquire(5, TimeUnit.SECONDS)) return;
+                            big = true;
+                        }
                         r.body = readN(in, n);
                     } else if (r.header("transfer-encoding").equalsIgnoreCase("chunked")) {
-                        r.body = readChunked(in);
+                        r.body = readChunked(in, Math.min(bodyMost, SMALL_BODY));
                     }
                     r.socket = s;
                     r.in = in;
                     r.out = out;
                     handler.handle(r);
+                    if (big) {
+                        big = false;
+                        BIG_BODIES.release();
+                    }
                     if (r.taken) {
                         taken = true;
                         return;
                     }
                     if (r.header("connection").equalsIgnoreCase("close")) return;
                 }
-            } catch (IOException | NumberFormatException ignored) {
+            } catch (IOException | RuntimeException | StackOverflowError ignored) {
+                // whatever a peer sends, the connection ends here and the app runs on
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } finally {
-                if (!taken) try { s.close(); } catch (IOException ignored) {}
+                if (big) BIG_BODIES.release();
+                if (!taken) closeQuietly(s);
             }
         }
 
@@ -221,20 +319,25 @@ final class Http {
         }
     }
 
-    private static byte[] readChunked(InputStream in) throws IOException {
+    private static byte[] readChunked(InputStream in, int most) throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         while (true) {
             String size = readLine(in);
             if (size == null) throw new IOException("the connection closed in a chunk");
             int semi = size.indexOf(';');
-            int n = Integer.parseInt((semi < 0 ? size : size.substring(0, semi)).trim(), 16);
+            int n;
+            try {
+                n = Integer.parseInt((semi < 0 ? size : size.substring(0, semi)).trim(), 16);
+            } catch (NumberFormatException e) {
+                throw new IOException("a bad chunk size");
+            }
             if (n == 0) {
                 while (true) {
                     String t = readLine(in);
                     if (t == null || t.isEmpty()) return b.toByteArray();
                 }
             }
-            if (b.size() + n > BODY_MOST) throw new IOException("a body too large");
+            if (n < 0 || n > most - b.size()) throw new IOException("a body too large");
             b.write(readN(in, n));
             readLine(in);
         }
@@ -291,12 +394,12 @@ final class Http {
                 if (n < 0 || n > BODY_MOST) throw new IOException("a body too large");
                 r.body = readN(in, n);
             } else if (r.header("transfer-encoding").equalsIgnoreCase("chunked")) {
-                r.body = readChunked(in);
+                r.body = readChunked(in, BODY_MOST);
             } else {
                 ByteArrayOutputStream b = new ByteArrayOutputStream();
                 byte[] buf = new byte[8192];
                 for (int n; (n = in.read(buf)) > 0; ) {
-                    if (b.size() + n > BODY_MOST) throw new IOException("a body too large");
+                    if (n > BODY_MOST - b.size()) throw new IOException("a body too large");
                     b.write(buf, 0, n);
                 }
                 r.body = b.toByteArray();

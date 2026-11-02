@@ -2,6 +2,8 @@ package dev.yancey.intercombridge;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -13,6 +15,10 @@ import java.util.concurrent.ExecutorService;
  * _intercom-bridge._tcp with its id and since when it has run; the port is its status page, which
  * says whether it is running. A bridge that finds another one alive stands by, and looks again each
  * round; when two run at once, the one that started first stays and the other stands down.
+ *
+ * Only a bridge with the same intercom key counts: the one asking sends a nonce, and the status
+ * page answers with an HMAC of its id, whether it runs, since and that nonce, keyed from the intercom
+ * key. So a host that only claims to be a bridge cannot make the others stand down.
  */
 final class Runner {
     static final String BRIDGE_SERVICE = "_intercom-bridge._tcp";
@@ -66,7 +72,7 @@ final class Runner {
     /** Runs rounds until {@link #stop}. */
     void run() {
         try {
-            status = new Http.Server(cfg.listen, statusPort, this::serveStatus, pool);
+            status = new Http.Server(cfg.listen, statusPort, this::serveStatus, pool, 1024); // GET only
         } catch (IOException e) {
             listener.state("off", "Status port " + statusPort + " is taken: " + e.getMessage());
             log.warn("The status port " + statusPort + " is taken; other bridges cannot see this one, so it stays off");
@@ -74,7 +80,11 @@ final class Runner {
         }
         try {
             while (!stopped) {
-                round();
+                try {
+                    round();
+                } catch (RuntimeException | StackOverflowError e) {
+                    log.warn("A round went wrong and the next one starts over: " + e);
+                }
                 if (stopped) break;
                 Thread.sleep(everyMs);
             }
@@ -139,10 +149,15 @@ final class Runner {
             if (s.txt("id").equals(id) || s.txt("id").isEmpty()) continue;
             // mDNS can remember a bridge that has gone; its status page is the word that it still runs.
             try {
-                Http.Response r = Http.request("GET", s.address, s.port, "/status", null, null, Ks.REQUEST_MS);
+                String nonce = Crypto.hex(Crypto.random(16));
+                Http.Response r = Http.request("GET", s.address, s.port, "/status?nonce=" + nonce, null, null, Ks.REQUEST_MS);
                 Map<String, Object> m = Json.object(r.body);
-                if (r.status == 200 && Json.bool(m, "active") && Json.str(m, "id").equals(s.txt("id"))) {
-                    out.add(new Other(Json.str(m, "id"), s.address, Json.num(m, "since")));
+                String otherId = Json.str(m, "id");
+                long otherSince = Json.num(m, "since");
+                byte[] got = Crypto.unhex(Json.str(m, "proof"));
+                if (r.status == 200 && Json.bool(m, "active") && otherId.equals(s.txt("id"))
+                        && got != null && MessageDigest.isEqual(got, proof(otherId, true, otherSince, nonce))) {
+                    out.add(new Other(otherId, s.address, otherSince));
                 }
             } catch (IOException ignored) {
             }
@@ -185,12 +200,25 @@ final class Runner {
             return;
         }
         Bridge b = bridge;
+        long at = b != null ? since : 0;
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", id);
         m.put("active", b != null);
-        m.put("since", b != null ? since : 0);
+        m.put("since", at);
+        String nonce = r.param("nonce");
+        if (!nonce.isEmpty() && nonce.length() <= 64) m.put("proof", Crypto.hex(proof(id, b != null, at, nonce)));
         if (b != null) m.putAll(b.status());
         else m.put("version", cfg.version);
         r.json(200, m);
+    }
+
+    /**
+     * What a bridge with this intercom key answers to nonce: an HMAC of its id, whether it runs, since
+     * and the nonce. Whether it runs is covered too, so a standby's answer can't be passed off as a running one's.
+     */
+    private byte[] proof(String bridgeId, boolean active, long at, String nonce) {
+        byte[] key = Crypto.sha256("intercom-bridge status:" + cfg.intercomKey);
+        return Crypto.hmac(key, (bridgeId + "\n" + (active ? "running" : "standing by") + "\n" + at + "\n" + nonce)
+                .getBytes(StandardCharsets.UTF_8));
     }
 }

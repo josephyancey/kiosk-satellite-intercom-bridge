@@ -57,6 +57,16 @@ The plugin needs no capabilities. It reaches Android's mDNS service through the 
 
 Nothing leaves your network. The plugin talks only to the kiosks and Echos it finds and to other copies of itself. Call audio and announcements pass through it without being recorded, and the key and house word stay on the kiosk.
 
+## Trust model
+
+The bridge joins two intercoms, so a secret for either one now reaches both:
+
+- **Anyone with the house word can ring every kiosk**, not just the Echos. A kiosk set to auto-answer then streams its microphone to whoever called. Treat the house word like the intercom key, and turn off auto-answer on kiosks where that matters.
+- **Anyone with the intercom key can ring every Echo**, and an Echo with Drop In on answers by itself.
+- **Announcements also take the house word in plain text.** Older TECHO5 devices send it in the `X-Techo5-House` header instead of signing, and the bridge accepts that too, as the devices do. Anyone who can watch the network can read it from such a request.
+- **Requests are checked as early as each protocol allows.** A kiosk's call token is checked before its body is parsed; an announcement's signature covers its voice, so that body is read first, within a 640 KB cap. The bridge also limits how many connections it serves and how much data it holds for senders it hasn't checked yet, since it runs inside Kiosk Satellite.
+- **Only bridges with the same intercom key count** when one decides whether to stand by. The status page proves the key with an HMAC of a nonce the asking bridge sends, so a host that only claims to be a bridge is ignored.
+
 ## Limits
 
 - Kiosk Satellite's intercom encryption (TLS) must be off.
@@ -82,4 +92,4 @@ The SDK sources in `sdk/` and the build tools in `tools/` come from the [Kiosk S
 
 ## License
 
-[Apache-2.0](LICENSE). Kiosk Satellite has its own application license. The handshake in `Sealed.java` follows TECHO5's (MIT, Copyright (c) 2026 TECHO5 contributors), and the X25519 code in `Crypto.java` follows [TweetNaCl](https://tweetnacl.cr.yp.to), which is in the public domain. The handset in the icon is `phone_in_talk` from Google's [Material Icons](https://github.com/google/material-design-icons), also Apache-2.0.
+[Apache-2.0](LICENSE). Kiosk Satellite has its own application license. This plugin is not affiliated with or endorsed by Kiosk Satellite or TECHO5. The handshake in `Sealed.java` follows TECHO5's (MIT, Copyright (c) 2026 TECHO5 contributors), and the X25519 code in `Crypto.java` follows [TweetNaCl](https://tweetnacl.cr.yp.to), which is in the public domain. The handset in the icon is `phone_in_talk` from Google's [Material Icons](https://github.com/google/material-design-icons), also Apache-2.0.

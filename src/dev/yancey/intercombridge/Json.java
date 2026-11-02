@@ -88,7 +88,7 @@ final class Json {
         try {
             Object v = parse(b);
             return v instanceof Map ? (Map<String, Object>) v : new LinkedHashMap<String, Object>();
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             return new LinkedHashMap<>();
         }
     }
@@ -113,9 +113,12 @@ final class Json {
         return v instanceof Map ? (Map<String, Object>) v : new LinkedHashMap<String, Object>();
     }
 
+    /** How deep objects and arrays may nest. Nothing the intercoms send goes past three. */
+    private static final int DEPTH_MOST = 32;
+
     private static final class Parser {
         final String s;
-        int i;
+        int i, depth;
 
         Parser(String s) { this.s = s; }
 
@@ -129,6 +132,16 @@ final class Json {
             space();
             if (i >= s.length()) throw bad();
             char c = s.charAt(i);
+            if (c != '{' && c != '[') return scalar(c);
+            if (++depth > DEPTH_MOST) throw new IOException("JSON: nested too deep");
+            try {
+                return container(c);
+            } finally {
+                depth--;
+            }
+        }
+
+        Object container(char c) throws IOException {
             if (c == '{') {
                 i++;
                 Map<String, Object> m = new LinkedHashMap<>();
@@ -162,6 +175,10 @@ final class Json {
                     if (d != ',') throw bad();
                 }
             }
+            throw bad();
+        }
+
+        Object scalar(char c) throws IOException {
             if (c == '"') return string();
             if (s.startsWith("true", i)) { i += 4; return Boolean.TRUE; }
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }

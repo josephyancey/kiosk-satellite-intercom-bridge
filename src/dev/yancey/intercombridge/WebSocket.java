@@ -84,6 +84,7 @@ final class WebSocket {
                 + accept(key) + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
         r.out.flush();
         r.taken = true;
+        r.trusted(); // callers check the call token first
         r.socket.setSoTimeout(0);
         r.socket.setTcpNoDelay(true);
         return new WebSocket(r.socket, r.in, r.out, false);
@@ -141,7 +142,7 @@ final class WebSocket {
                 len = 0;
                 for (int i = 0; i < 8; i++) len = len << 8 | (in.read() & 0xff);
             }
-            if (len > READ_MOST) throw new IOException("a WebSocket message too large");
+            if (len < 0 || len > READ_MOST) throw new IOException("a WebSocket message too large"); // 64-bit lengths can come in negative
             byte[] m = (b1 & 0x80) != 0 ? Http.readN(in, 4) : null;
             byte[] p = Http.readN(in, (int) len);
             if (m != null) for (int i = 0; i < p.length; i++) p[i] ^= m[i & 3];

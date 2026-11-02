@@ -184,6 +184,7 @@ final class T5Link {
             if (hdr[0] != HELLO || n > FRAME_BYTES) throw new IOException("the caller did not say who it is");
             byte[] name = new byte[n];
             c.readFully(name);
+            r.trusted(); // the handshake proved the house word
             return new Accepted(new T5Link(s, c, inbox), shownName(new String(name, StandardCharsets.UTF_8)));
         } catch (IOException e) {
             s.close();

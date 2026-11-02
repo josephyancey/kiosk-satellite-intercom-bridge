@@ -42,6 +42,8 @@ public final class IntercomBridgeTest {
         echoCallsKiosk();
         echoAnnouncesToKiosk();
         oneBridgeAtATime();
+        hostileInput();
+        forgedBridge();
         System.out.println("IntercomBridgeTest: all passed");
         System.exit(0);
     }
@@ -190,7 +192,7 @@ public final class IntercomBridgeTest {
         volatile String answer = "ringing";
 
         FakeKiosk() throws IOException {
-            srv = new Http.Server("127.0.0.1", 0, this::serve, pool);
+            srv = new Http.Server("127.0.0.1", 0, this::serve, pool, Http.BODY_MOST);
         }
 
         int port() { return srv.port(); }
@@ -248,7 +250,7 @@ public final class IntercomBridgeTest {
         final T5Announce ann = new T5Announce(WORD);
 
         FakeEcho() throws IOException {
-            srv = new Http.Server("127.0.0.1", 0, this::serve, pool);
+            srv = new Http.Server("127.0.0.1", 0, this::serve, pool, Http.BODY_MOST);
         }
 
         void serve(Http.Request r) throws IOException {
@@ -446,5 +448,145 @@ public final class IntercomBridgeTest {
         b.stop();
         tb.interrupt();
         System.out.println("one bridge at a time ok");
+    }
+
+    /** A host that only claims to be a running bridge, or one with another key, does not stop this one. */
+    static void forgedBridge() throws Exception {
+        FakeMdns.ads.clear();
+        Http.Server fake = new Http.Server("127.0.0.1", 0, r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", "0000000000000000");
+            m.put("active", true);
+            m.put("since", 0);
+            m.put("proof", "00");
+            r.json(200, m);
+        }, pool);
+        Map<String, String> txt = new LinkedHashMap<>();
+        txt.put("id", "0000000000000000");
+        new FakeMdns("127.0.0.1").advertise("intercom-bridge-0000000000000000", Runner.BRIDGE_SERVICE, fake.port(), txt);
+        Bridge.Config other = config();
+        other.intercomKey = "another fleet";
+        int p = 44000 + (int) (Math.random() * 1000);
+        Runner.Listener quiet = (level, text) -> {};
+        Runner stranger = new Runner(other, new FakeMdns("127.0.0.1"), pool, QUIET, quiet, "1111111111111111", p, 50);
+        Thread ts = new Thread(stranger::run);
+        ts.start();
+        for (int i = 0; i < 100 && !stranger.active(); i++) Thread.sleep(20);
+        check(stranger.active(), "a bridge of another fleet runs");
+        Runner b = new Runner(config(), new FakeMdns("127.0.0.1"), pool, QUIET, quiet, "bbbbbbbbbbbbbbbb", p + 1, 50);
+        Thread tb = new Thread(b::run);
+        tb.start();
+        for (int i = 0; i < 100 && !b.active(); i++) Thread.sleep(20);
+        Thread.sleep(300);
+        check(b.active(), "a forged status page and another fleet's bridge do not make this one stand by");
+
+        // A standby's real answer, relayed with "active" turned on, must not pass for a running bridge.
+        Runner c = new Runner(config(), new FakeMdns("127.0.0.1"), pool, QUIET, quiet, "0ccccccccccccccc", p + 2, 50);
+        Thread tc = new Thread(c::run);
+        tc.start();
+        Thread.sleep(300);
+        check(!c.active(), "a third bridge stands by");
+        Http.Server relay = new Http.Server("127.0.0.1", 0, r -> {
+            Http.Response real = Http.request("GET", "127.0.0.1", p + 2, "/status?" + r.query, null, null, 2000);
+            Map<String, Object> m = Json.object(real.body);
+            m.put("active", true);
+            r.json(200, m);
+        }, pool);
+        Map<String, String> ctxt = new LinkedHashMap<>();
+        ctxt.put("id", "0ccccccccccccccc");
+        new FakeMdns("127.0.0.1").advertise("intercom-bridge-0ccccccccccccccc", Runner.BRIDGE_SERVICE, relay.port(), ctxt);
+        Thread.sleep(400);
+        check(b.active(), "a relayed standby's answer does not make the running bridge stand down");
+        c.stop();
+        tc.interrupt();
+        relay.close();
+        b.stop();
+        tb.interrupt();
+        stranger.stop();
+        ts.interrupt();
+        fake.close();
+        System.out.println("forged bridge ok");
+    }
+
+    /** What a host on the network can send without a key ends that request and nothing else. */
+    static void hostileInput() throws Exception {
+        Http.Server srv = new Http.Server("127.0.0.1", 0, r -> r.text(200, "ok"), pool, Http.SMALL_BODY);
+        for (String size : new String[] {"-1", "7fffffff", "-80000000", "zz"}) {
+            String reply = raw(srv.port(), "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" + size + "\r\n");
+            check(!reply.startsWith("HTTP/1.1 200"), "a chunk of size " + size + " is refused");
+        }
+        check(raw(srv.port(), "POST / HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n").isEmpty(), "a body over the port's limit is refused");
+        check(raw(srv.port(), "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").startsWith("HTTP/1.1 200"), "the server still answers");
+
+        StringBuilder deep = new StringBuilder();
+        for (int i = 0; i < 200000; i++) deep.append('[');
+        check(Json.object(deep.toString().getBytes(StandardCharsets.UTF_8)).isEmpty(), "deep JSON is refused, not overflowed");
+        try {
+            Json.parse(deep.toString());
+            check(false, "deep JSON parses");
+        } catch (IOException expected) {
+        }
+        check(Json.object("{\"a\":[[{\"b\":1}]]}".getBytes(StandardCharsets.UTF_8)).containsKey("a"), "ordinary JSON still parses");
+
+        Ks.Auth auth = new Ks.Auth(KEY);
+        Http.Server standin = new Http.Server("127.0.0.1", 0, Ks.standin("id", "name", "v", new int[1], auth, null), pool, Http.SMALL_BODY);
+        String reply = raw(standin.port(), "POST /api/intercom/call HTTP/1.1\r\nContent-Length: " + 20000 + "\r\nConnection: close\r\n\r\n"
+                + deep.substring(0, 20000));
+        check(reply.startsWith("HTTP/1.1 403"), "a call with no token is refused before its body is read");
+
+        List<Socket> held = new ArrayList<>();
+        for (int i = 0; i < 20; i++) held.add(new Socket("127.0.0.1", srv.port()));
+        Thread.sleep(200);
+        check(raw(srv.port(), "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").isEmpty(), "connections past the port's limit are closed");
+        for (Socket s : held) s.close();
+        Thread.sleep(200);
+        check(raw(srv.port(), "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").startsWith("HTTP/1.1 200"), "and taken again once others close");
+        srv.close();
+        standin.close();
+
+        // A WebSocket frame whose 64-bit length has the top bit set.
+        try (ServerSocket ss = new ServerSocket(0)) {
+            pool.execute(() -> {
+                try (Socket s = ss.accept()) {
+                    java.io.InputStream in = new java.io.BufferedInputStream(s.getInputStream());
+                    String key = "";
+                    for (String line; !(line = Http.readLine(in)).isEmpty(); ) {
+                        if (line.toLowerCase(java.util.Locale.ROOT).startsWith("sec-websocket-key:")) key = line.substring(18).trim();
+                    }
+                    String accept = java.util.Base64.getEncoder().encodeToString(java.security.MessageDigest.getInstance("SHA-1")
+                            .digest((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes(StandardCharsets.ISO_8859_1)));
+                    s.getOutputStream().write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                            + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                    s.getOutputStream().write(new byte[] {(byte) 0x82, 127, (byte) 0x80, 0, 0, 0, 0, 0, 0, 1});
+                    s.getOutputStream().flush();
+                    Thread.sleep(1000);
+                } catch (Exception ignored) {
+                }
+            });
+            WebSocket ws = WebSocket.dial("127.0.0.1", ss.getLocalPort(), "/", 2000);
+            try {
+                ws.read();
+                check(false, "a negative WebSocket length is read");
+            } catch (IOException expected) {
+            }
+            ws.close();
+        }
+        System.out.println("hostile input ok");
+    }
+
+    /** Sends request as is and returns whatever comes back before the server closes or goes quiet. */
+    static String raw(int port, String request) throws IOException {
+        try (Socket s = new Socket("127.0.0.1", port)) {
+            s.setSoTimeout(2000);
+            s.getOutputStream().write(request.getBytes(StandardCharsets.ISO_8859_1));
+            s.getOutputStream().flush();
+            java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            try {
+                for (int n; (n = s.getInputStream().read(buf)) > 0; ) b.write(buf, 0, n);
+            } catch (IOException quiet) {
+            }
+            return new String(b.toByteArray(), StandardCharsets.ISO_8859_1);
+        }
     }
 }
