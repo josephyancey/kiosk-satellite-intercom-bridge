@@ -25,8 +25,8 @@ import javax.crypto.KeyAgreement;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/** Runs on a desktop JVM: java -ea dev.yancey.intercombridge.BridgeTest */
-public final class BridgeTest {
+/** Runs on a desktop JVM: java -ea dev.yancey.intercombridge.IntercomBridgeTest */
+public final class IntercomBridgeTest {
     static final String KEY = "fleet-key", WORD = "house word";
     static final ExecutorService pool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r);
@@ -42,7 +42,7 @@ public final class BridgeTest {
         echoCallsKiosk();
         echoAnnouncesToKiosk();
         oneBridgeAtATime();
-        System.out.println("BridgeTest: all passed");
+        System.out.println("IntercomBridgeTest: all passed");
         System.exit(0);
     }
 

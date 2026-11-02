@@ -1,26 +1,8 @@
 # Intercom Bridge
 
-A [Kiosk Satellite](https://github.com/jxlarrea/kiosk-satellite) plugin that lets Kiosk Satellite
-kiosks and [TECHO5](https://github.com/HuskerMinion/techo5) Echos call and announce to each other.
-It runs inside a kiosk, so there is no server to keep up.
+A [Kiosk Satellite](https://github.com/jxlarrea/kiosk-satellite) plugin that lets Kiosk Satellite kiosks and [TECHO5](https://github.com/HuskerMinion/techo5) Echos call and announce to each other. Each Echo shows up in the kiosks' intercom list like any other kiosk, and each kiosk shows up in the Echos' call list.
 
-## What it does
-
-- **Echos show up on the kiosks.** Each TECHO5 device appears in **Call a kiosk** like any other
-  kiosk, and calling it rings the Echo. Calling a room by voice works too.
-- **Kiosks show up on the Echos.** Each kiosk appears in the TECHO5 call list, and "call the
-  kitchen" from an Echo rings the kitchen kiosk.
-- **Answering works either way**, including a kiosk's auto-answer and an Echo's Drop In.
-- **Announcements cross over.** A kiosk's **Announce to all** plays on the Echos, and an Echo's
-  announcement plays on the kiosks.
-- **Calls can hang up on silence**, for an Echo that has no button to end them.
-
-## One bridge at a time
-
-Only one bridge runs on the network at a time. The one running advertises itself over mDNS, and
-the copies on other kiosks stand by. When the running one stops, because its kiosk restarted or
-lost its network, a standby takes over within about a minute. So you can install it on two or
-three kiosks, or on the whole fleet.
+Calling works either way, by touch or by voice ("call the kitchen" from an Echo rings the kitchen kiosk), and so does answering, including a kiosk's auto-answer and an Echo's Drop In. A kiosk's **Announce to all** plays on the Echos, and an Echo's announcement plays on the kiosks. Calls can also hang up on silence, for an Echo that has no button to end them.
 
 ## Installation
 
@@ -28,81 +10,76 @@ three kiosks, or on the whole fleet.
 
 Intercom Bridge is listed in [Community Plugins](https://kiosksatellite.com/plugins/). Use the button below to open it in your Kiosk Satellite and install it.
 
-[![Install in Kiosk Satellite](https://kiosksatellite.com/img/badges/plugin-add.svg)](https://kiosksatellite.com/redirect/plugin/?repository=josephyancey/intercom-bridge-plugin)
+[![Install in Kiosk Satellite](https://kiosksatellite.com/img/badges/plugin-add.svg)](https://kiosksatellite.com/redirect/plugin/?repository=josephyancey/kiosk-satellite-intercom-bridge)
 
 Or search for `Intercom Bridge` in **Settings > Plugin Manager > Browse plugins** in Kiosk Satellite.
 
 ### Manual
 
 1. Open **Settings > Plugin Manager** in Kiosk Satellite and turn on **Enable Plugins**.
-2. Choose **Add plugin**, paste `https://github.com/josephyancey/intercom-bridge-plugin` and choose **Preview**.
+2. Choose **Add plugin**, paste `https://github.com/josephyancey/kiosk-satellite-intercom-bridge` and choose **Preview**.
 3. Review the plugin and choose **Trust and install**.
 
-## Set up
+## Setup
 
-1. On the TECHO5 devices, set a house word under **Sound & Voice**.
-2. Install the plugin on a kiosk that stays on. On a fleet leader, add it to a fleet profile to
-   give every follower a standby copy.
-3. Open the plugin and enter the **Kiosk Satellite intercom key** (from **Settings > Intercom**) and
-   the **TECHO5 house word**, then enable it.
+1. Set a house word on the TECHO5 devices under **Sound & Voice**.
+2. Turn off intercom encryption (TLS) under **Intercom** on the kiosks. The bridge does not speak it yet.
+3. Enable the plugin on a kiosk that stays on and enter the **Kiosk Satellite intercom key** (from **Settings > Intercom**) and the **TECHO5 house word**. Within a minute the status line shows the kiosks and Echos it found, and the Remote Admin Overview has an **Intercom bridge** tile.
 
-Within a minute the plugin's status shows the kiosks and Echos it found, and the Remote Admin
-Overview has an **Intercom bridge** tile.
-
-Kiosk Satellite's intercom encryption (TLS) must be off: the bridge does not speak it yet.
+Only one bridge runs on the network at a time, so it is safe to install it on several kiosks: the others stand by, and one takes over within about a minute if the running one goes away. With a fleet, install it on the leader and add it to the profile's **Plugins** row, with **Plugin secrets** on under the profile's Credentials so the key and house word go along too. Leave **This kiosk's address** empty there, so each kiosk finds its own.
 
 ## Settings
 
-| Setting | Default | What it is |
-|---|---|---|
-| Kiosk Satellite intercom key | | The fleet's intercom key. |
-| TECHO5 house word | | The house word on the TECHO5 devices. |
-| Echo name suffix | none | Added to each Echo's name in the kiosks' list, like ` (Echo)`. |
-| Hang up after silence | 0 s | End a call once neither side has spoken this long. 0 is off. |
-| Silence level | -55 dBFS | Below this counts as silence. |
-| Volume to Echos / to kiosks | 0 dB | Make one side louder or quieter on the other. |
-| This kiosk's address | found | The IPv4 address devices reach this kiosk on. |
-| Status port | 8790 | Serves `/status`, which other bridges check. |
-| First / last stand-in port | 41000-41099 | Each kiosk and Echo gets a stand-in on one of these ports. |
+| Setting | What it does |
+| --- | --- |
+| Kiosk Satellite intercom key | The fleet's intercom key. Stored as a secret, masked in the Plugin Manager |
+| TECHO5 house word | The house word on the TECHO5 devices. Stored as a secret |
+| Echo name suffix | Added to each Echo's name in the kiosks' list, such as ` (Echo)`. Empty by default |
+| Hang up after silence | Ends a call once neither side has spoken this long. 0 s, the default, is off |
+| Silence level | Sound below this, -55 dBFS by default, counts as silence for the hang-up |
+| Volume to Echos | Makes kiosks louder or quieter on the Echos, 0 dB by default |
+| Volume to kiosks | Makes Echos louder or quieter on the kiosks, 0 dB by default |
+| This kiosk's address | The IPv4 address kiosks and Echos reach this kiosk on. Empty finds it |
+| Status port | Serves `/status`, which other bridges check before they stand by. 8790 unless you change it |
+| First / last stand-in port | Each kiosk and Echo gets a stand-in on one of these ports, 41000 to 41099 |
 
-`http://<kiosk>:8790/status` shows whether this copy is the one running, what it found, and calls
-in progress.
+`http://<kiosk>:8790/status` shows whether this copy is the one running, what it found and the calls in progress.
 
 ## How it works
 
-Every Echo gets a stand-in kiosk, advertised on this kiosk's address with its own port, which the
-kiosks list and call. Every kiosk gets a stand-in TECHO5 device the same way. A call to a stand-in
-becomes a call to the real device, and the bridge carries the audio, converting Kiosk Satellite's
-80 ms frames to TECHO5's 20 ms ones. The TECHO5 side uses the same Noise handshake the devices do
-(Noise_NNpsk0_25519_ChaChaPoly_SHA256, keyed by the house word); the Kiosk Satellite side follows
-the protocol [Kiosk Phone](https://github.com/mpjanofsky/kiosk-phone) documented. No Kiosk
-Satellite code is used.
+Every Echo gets a stand-in kiosk, advertised over mDNS on this kiosk's address with its own port, which the kiosks list and call. Every kiosk gets a stand-in TECHO5 device the same way. A call to a stand-in becomes a call to the real device, and the bridge carries the audio between them, converting Kiosk Satellite's 80 ms frames to TECHO5's 20 ms ones.
 
-The plugin needs no special capabilities. It reaches Android's mDNS service through the app.
+- The TECHO5 side uses the same Noise handshake the devices do (Noise_NNpsk0_25519_ChaChaPoly_SHA256, keyed by the house word).
+- The Kiosk Satellite side follows the intercom protocol [Kiosk Phone](https://github.com/mpjanofsky/kiosk-phone) documented. No Kiosk Satellite code is used.
+- The running bridge advertises `_intercom-bridge._tcp`. A copy that finds one alive stands by and looks again every 30 seconds. If two run at once, the one that started first stays.
 
-## Where data goes
+The plugin needs no capabilities. It reaches Android's mDNS service through the app's context.
 
-Nothing leaves your network. The plugin talks only to the kiosks and TECHO5 devices it finds over
-mDNS, and to other copies of itself. Call audio and announcements pass through it between those
-devices, encrypted on the TECHO5 side and sent as Kiosk Satellite's own intercom sends them on the
-kiosk side; it records nothing. The intercom key and house word stay on the kiosk. The status page
-on port 8790 has no password and lists the devices found, their addresses and calls in progress,
-to anyone on the network.
+Nothing leaves your network. The plugin talks only to the kiosks and Echos it finds and to other copies of itself. Call audio and announcements pass through it without being recorded, and the key and house word stay on the kiosk.
 
-## Building
+## Limits
 
-Needs Python 3, JDK 17 or newer, and an Android SDK with a platform and build-tools.
+- Kiosk Satellite's intercom encryption (TLS) must be off.
+- The status page has no password. Anyone on the network can see the devices found, their addresses and the calls in progress.
+- Kiosks and Echos must hear each other's mDNS. Across VLANs, the router has to relay it.
+
+## Build and test
+
+Install Python 3, JDK 17 or newer and an Android SDK with a platform and build-tools. Set `ANDROID_HOME` and `JAVA_HOME` as needed.
 
 ```sh
 python3 tools/test.py
 python3 tools/build.py
 ```
 
-The ZIP lands in `dist/`. For a test build, use **Plugin Manager > Developer Tools > Install from
-ZIP**. Releases are built by GitHub Actions from a published release tag.
+The build writes `dist/intercom-bridge-<version>.zip`. For local testing, install it with **Plugin Manager > Developer Tools > Install from ZIP**. Without a local SDK, `build.sh` runs both inside the `ghcr.io/cirruslabs/flutter` image:
+
+```sh
+docker run --rm -v "$PWD:/src" ghcr.io/cirruslabs/flutter:3.44.0 sh /src/build.sh
+```
+
+The SDK sources in `sdk/` and the build tools in `tools/` come from the [Kiosk Satellite plugin SDK](https://github.com/jxlarrea/kiosk-satellite-plugins).
 
 ## License
 
-MIT. The SDK and build tools under `sdk/` and `tools/` come from the
-[Kiosk Satellite plugin template](https://github.com/jxlarrea/kiosk-satellite-plugins) under
-Apache-2.0 (`LICENSE-SDK`). See `THIRD_PARTY.md`.
+[Apache-2.0](LICENSE). Kiosk Satellite has its own application license. The handshake in `Sealed.java` follows TECHO5's (MIT, Copyright (c) 2026 TECHO5 contributors), and the X25519 code in `Crypto.java` follows [TweetNaCl](https://tweetnacl.cr.yp.to), which is in the public domain. The handset in the icon is `phone_in_talk` from Google's [Material Icons](https://github.com/google/material-design-icons), also Apache-2.0.

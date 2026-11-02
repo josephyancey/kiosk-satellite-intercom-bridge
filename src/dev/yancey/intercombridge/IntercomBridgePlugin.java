@@ -24,7 +24,7 @@ import me.jxl.kiosk.plugins.PluginHost;
  * the network at a time, and another takes over when it stops.
  */
 public final class IntercomBridgePlugin implements KioskPlugin {
-    static final String VERSION = "0.2.3";
+    static final String VERSION = "1.0.0";
     private static final long EVERY_MS = 30000;
 
     private PluginHost host;

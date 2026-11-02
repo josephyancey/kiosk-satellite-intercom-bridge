@@ -11,6 +11,6 @@ for source in sorted((root / 'sdk/src/me/jxl/kiosk/plugins').glob('*.java')):
     target = app / source.name
     if not target.exists() or source.read_bytes() != target.read_bytes():
         raise SystemExit(f'SDK mismatch: {source.name}')
-if (root / 'LICENSE-SDK').read_bytes() != (app / 'LICENSE').read_bytes():
+if (root / 'LICENSE').read_bytes() != (app / 'LICENSE').read_bytes():
     raise SystemExit('SDK license mismatch')
 print('SDK interfaces and license match the application.')
