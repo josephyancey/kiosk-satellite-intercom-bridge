@@ -53,7 +53,7 @@ Every Echo gets a stand-in kiosk, advertised over mDNS on this kiosk's address w
 - The Kiosk Satellite side follows the intercom protocol [Kiosk Phone](https://github.com/mpjanofsky/kiosk-phone) documented. No Kiosk Satellite code is used.
 - The running bridge advertises `_intercom-bridge._tcp`. A copy that finds one alive stands by and looks again every 30 seconds. It takes over after two looks in a row clearly found none running. A look in doubt, one that failed or found a bridge it could not reach, never counts as clear, so a missed answer does not start a second bridge; only about five minutes of such looks, for a bridge that went without saying goodbye, let it take over. If two run at once anyway, the one that started first stays.
 
-The plugin needs no capabilities. It reaches Android's mDNS service through the app's context, with mDNS clients of its own where Android allows, so its lookups do not hold up Kiosk Satellite's. The status page says when it had to use the app's own.
+The plugin needs no capabilities. It finds devices by listening to mDNS itself, the way Kiosk Satellite finds its fleet, since some Android builds' mDNS service misses much of what kiosks announce. It listens only to the mDNS group, so it never takes replies meant for Android or Kiosk Satellite, and holds a Wi-Fi multicast lock while it runs. It advertises through Android's mDNS service, which also does the looking if the group cannot be joined; the status page then says why, under `listener`.
 
 Nothing leaves your network. The plugin talks only to the kiosks and Echos it finds and to other copies of itself. Call audio and announcements pass through it without being recorded, and the key and house word stay on the kiosk.
 

@@ -1,7 +1,13 @@
 package dev.yancey.intercombridge;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.MulticastSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -14,11 +20,13 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
 import javax.crypto.KeyAgreement;
@@ -47,6 +55,10 @@ public final class IntercomBridgeTest {
         failedLookStandsBy();
         hostileInput();
         forgedBridge();
+        groupMdnsRecords();
+        groupMdnsHostile();
+        groupMdnsLooks();
+        groupMdnsFallsBack();
         System.out.println("IntercomBridgeTest: all passed");
         System.exit(0);
     }
@@ -722,6 +734,302 @@ public final class IntercomBridgeTest {
             ws.close();
         }
         System.out.println("hostile input ok");
+    }
+
+    // ---- the bridge's own mDNS listener ----
+
+    static byte[] dnsName(String... labels) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        for (String l : labels) {
+            byte[] b = l.getBytes(StandardCharsets.UTF_8);
+            o.write(b.length);
+            o.write(b, 0, b.length);
+        }
+        o.write(0);
+        return o.toByteArray();
+    }
+
+    static byte[] cat(byte[]... parts) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        for (byte[] p : parts) o.write(p, 0, p.length);
+        return o.toByteArray();
+    }
+
+    static byte[] u16(int v) { return new byte[] {(byte) (v >> 8), (byte) v}; }
+
+    static byte[] rr(byte[] name, int type, long ttl, byte[] data) {
+        return cat(name, u16(type), u16(0x8001), u16((int) (ttl >> 16)), u16((int) ttl), u16(data.length), data);
+    }
+
+    /** A response with the given records as answers, under flags (0x8400 for an authoritative answer). */
+    static byte[] dnsResponse(int flags, byte[]... records) {
+        return cat(u16(0), u16(flags), u16(0), u16(records.length), u16(0), u16(0), cat(records));
+    }
+
+    static byte[] srvData(int port, byte[] target) { return cat(u16(0), u16(0), u16(port), target); }
+
+    static byte[] txtData(String... entries) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        for (String e : entries) {
+            byte[] b = e.getBytes(StandardCharsets.UTF_8);
+            o.write(b.length);
+            o.write(b, 0, b.length);
+        }
+        return o.toByteArray();
+    }
+
+    static byte[] aData(int a, int b, int c, int d) { return new byte[] {(byte) a, (byte) b, (byte) c, (byte) d}; }
+
+    static void groupMdnsRecords() {
+        String domain = "_t._tcp.local";
+        GroupMdns.Cache c = new GroupMdns.Cache();
+        byte[] type = dnsName("_t", "_tcp", "local"), inst = dnsName("Office Tablet", "_t", "_tcp", "local");
+        byte[] host = dnsName("office", "local");
+        byte[] full = dnsResponse(0x8400,
+                rr(type, 12, 120, inst),
+                rr(inst, 33, 120, srvData(2324, host)),
+                rr(inst, 16, 120, txtData("id=1", "name=Office Tablet", "ID=2", "flag", "")),
+                rr(host, 1, 120, aData(10, 0, 0, 5)));
+        c.handle(full, full.length, "10.0.0.99", 1000);
+        GroupMdns.Cache.Look l = c.look(domain, 2000);
+        check(l.found == 1 && l.complete == 1 && l.services.size() == 1, "one service, complete");
+        Mdns.Service s = l.services.get(0);
+        check(s.instance.equals("Office Tablet") && s.address.equals("10.0.0.5") && s.port == 2324, "instance, address and port");
+        check(s.txt("id").equals("1") && s.txt("name").equals("Office Tablet") && s.txt.containsKey("flag") && s.txt("flag").isEmpty(),
+                "TXT: first of a key counts, keys ignore case, a bare key is empty");
+        check(c.look("_T._TCP.local", 2000).found == 1, "domains match without regard to case");
+        check(c.missing(domain, 2000).isEmpty(), "nothing missing");
+
+        // Expired after its time to live; gone at once with a goodbye.
+        check(c.look(domain, 1000 + 121000).found == 0, "expires with its TTL");
+        c.handle(full, full.length, "10.0.0.99", 200000);
+        byte[] bye = dnsResponse(0x8400, rr(type, 12, 0, inst));
+        c.handle(bye, bye.length, "10.0.0.99", 200001);
+        check(c.look(domain, 200002).found == 0, "a goodbye ends it");
+
+        // Only a PTR: the look asks for the rest, then for the host's address.
+        GroupMdns.Cache d = new GroupMdns.Cache();
+        byte[] dotted = dnsName("Mr. Echo", "_t", "_tcp", "local");
+        byte[] ptr = dnsResponse(0x8400, rr(type, 12, 120, dotted));
+        d.handle(ptr, ptr.length, "10.0.0.7", 0);
+        List<String[]> q = d.missing(domain, 1);
+        check(q.size() == 2 && q.get(0)[1].equals("33") && q.get(1)[1].equals("16"), "asks for SRV and TXT: " + q.size());
+        GroupMdns.Reader asked = new GroupMdns.Reader(GroupMdns.Cache.query(q.get(0)[0], 33), 512);
+        asked.pos = 12;
+        check(asked.name().equals(Arrays.asList("Mr. Echo", "_t", "_tcp", "local")), "an instance with a dot stays one label");
+        GroupMdns.Cache.Look partial = d.look(domain, 1);
+        check(partial.found == 1 && partial.complete == 0 && partial.services.isEmpty(), "found but not resolved");
+        byte[] srv = dnsResponse(0x8400, rr(dotted, 33, 120, srvData(41000, dnsName("bridge", "local"))));
+        d.handle(srv, srv.length, "10.0.0.7", 2);
+        q = d.missing(domain, 3);
+        check(q.size() == 2 && q.get(1)[1].equals("1") && q.get(1)[0].equals("bridge.local"), "then the address of its host");
+        check(d.look(domain, 3).services.isEmpty(), "not returned without its TXT, which says whether it is a stand-in");
+        byte[] txt = dnsResponse(0x8400, rr(dotted, 16, 120, txtData("standin=1")));
+        d.handle(txt, txt.length, "10.0.0.7", 3);
+        partial = d.look(domain, 3);
+        check(partial.services.size() == 1 && partial.services.get(0).address.equals("10.0.0.7") && partial.complete == 0,
+                "without an address record, the sender's address, and still incomplete");
+        // A goodbye for a record replaced since leaves the new one alone.
+        byte[] oldSrvBye = dnsResponse(0x8400, rr(dotted, 33, 0, srvData(40999, dnsName("bridge", "local"))));
+        byte[] oldTxtBye = dnsResponse(0x8400, rr(dotted, 16, 0, txtData("standin=0")));
+        d.handle(oldSrvBye, oldSrvBye.length, "10.0.0.7", 4);
+        d.handle(oldTxtBye, oldTxtBye.length, "10.0.0.7", 4);
+        check(d.look(domain, 5).services.size() == 1, "goodbyes for old records do not end the new ones");
+        byte[] srvBye = dnsResponse(0x8400, rr(dotted, 33, 0, srvData(41000, dnsName("bridge", "local"))));
+        d.handle(srvBye, srvBye.length, "10.0.0.7", 6);
+        check(d.look(domain, 7).services.isEmpty(), "a goodbye for its own record does");
+
+        // Asked for its port and never answering, it has gone, until it sends its PTR again.
+        GroupMdns.Cache g = new GroupMdns.Cache();
+        g.handle(ptr, ptr.length, "10.0.0.7", 0);
+        check(g.missing(domain, 0).size() == 2 && g.look(domain, 1).found == 1, "found, and asked about");
+        long later = GroupMdns.Cache.GONE_MS;
+        GroupMdns.Cache.Look gone = g.look(domain, later);
+        check(gone.found == 0 && gone.gone == 1, "gone once unanswered, and counted as a doubt");
+        List<String[]> still = g.missing(domain, later);
+        check(still.size() == 1 && still.get(0)[1].equals("33"), "still asked for its port alone");
+        g.handle(ptr, ptr.length, "10.0.0.7", later + 1);
+        check(g.look(domain, later + 2).found == 1, "back with its PTR");
+        GroupMdns.Cache h = new GroupMdns.Cache();
+        h.handle(ptr, ptr.length, "10.0.0.7", 0);
+        h.missing(domain, 0);
+        h.handle(srv, srv.length, "10.0.0.7", later + 1);
+        check(h.look(domain, later + 2).found == 1, "or with its port, answered at last");
+
+        // A compressed name, pointing back at the type's name.
+        GroupMdns.Cache e = new GroupMdns.Cache();
+        byte[] head = cat(u16(0), u16(0x8400), u16(0), u16(2), u16(0), u16(0));
+        int typeAt = head.length;
+        byte[] ptr2 = cat(head, rr(type, 12, 120, cat(new byte[] {4, 'K', 'i', 't', 'c'}, new byte[] {(byte) 0xc0, (byte) typeAt})));
+        int instAt = typeAt + type.length + 10;
+        byte[] packed = cat(ptr2, rr(new byte[] {(byte) 0xc0, (byte) instAt}, 33, 120, srvData(9, new byte[] {(byte) 0xc0, (byte) typeAt})));
+        e.handle(packed, packed.length, "10.0.0.8", 0);
+        byte[] kitcTxt = dnsResponse(0x8400, rr(dnsName("Kitc", "_t", "_tcp", "local"), 16, 120, txtData("id=k")));
+        e.handle(kitcTxt, kitcTxt.length, "10.0.0.8", 0);
+        GroupMdns.Cache.Look k = e.look(domain, 1);
+        check(k.found == 1 && k.services.size() == 1 && k.services.get(0).instance.equals("Kitc") && k.services.get(0).port == 9,
+                "compressed names read");
+
+        // A query, or an error response, adds nothing; nor does an instance of another domain.
+        GroupMdns.Cache f = new GroupMdns.Cache();
+        byte[] query = dnsResponse(0x0000, rr(type, 12, 120, inst));
+        byte[] error = dnsResponse(0x8403, rr(type, 12, 120, inst));
+        byte[] other = dnsResponse(0x8400, rr(type, 12, 120, dnsName("X", "_u", "_tcp", "local")));
+        for (byte[] p : new byte[][] {query, error, other}) f.handle(p, p.length, "10.0.0.9", 0);
+        check(f.look(domain, 1).found == 0, "queries, errors and strangers' instances ignored");
+    }
+
+    static void groupMdnsHostile() {
+        String domain = "_t._tcp.local";
+        byte[] type = dnsName("_t", "_tcp", "local"), inst = dnsName("A", "_t", "_tcp", "local");
+        byte[] full = dnsResponse(0x8400, rr(type, 12, 120, inst), rr(inst, 33, 120, srvData(1, dnsName("h", "local"))));
+        // Cut short anywhere: nothing taken, nothing thrown.
+        for (int n = 0; n < full.length; n++) {
+            GroupMdns.Cache c = new GroupMdns.Cache();
+            c.handle(full, n, "10.0.0.1", 0);
+            check(c.look(domain, 1).found == 0, "a cut-off packet adds nothing (" + n + ")");
+        }
+        // Pointer loops, forward pointers and bad labels.
+        GroupMdns.Cache c = new GroupMdns.Cache();
+        byte[] head = cat(u16(0), u16(0x8400), u16(0), u16(1), u16(0), u16(0));
+        for (byte[] bad : new byte[][] {
+                cat(head, new byte[] {(byte) 0xc0, 12}), // points at itself
+                cat(head, new byte[] {(byte) 0xc0, 40}), // points forward
+                cat(head, new byte[] {(byte) 0x80, 1}), // a reserved label kind
+                cat(head, new byte[] {63, 'a'})}) { // runs past the end
+            c.handle(bad, bad.length, "10.0.0.1", 0);
+        }
+        // Noise, and a flood of instances: bounded.
+        Random rnd = new Random(7);
+        for (int i = 0; i < 20000; i++) {
+            byte[] junk = new byte[rnd.nextInt(80)];
+            rnd.nextBytes(junk);
+            if (junk.length > 3) { junk[2] = (byte) 0x84; junk[3] = 0; }
+            c.handle(junk, junk.length, "10.0.0.1", 0);
+        }
+        for (int i = 0; i < 3000; i++) {
+            byte[] p = dnsResponse(0x8400, rr(type, 12, 120, dnsName("n" + i, "_t", "_tcp", "local")));
+            c.handle(p, p.length, "10.0.0.1", 0);
+        }
+        int found = c.look(domain, 1).found;
+        check(found > 0 && found <= 1024, "instances kept are bounded: " + found);
+        check(c.missing(domain, 1).size() <= 66, "questions per look are bounded");
+        // Each new PTR paired with a short-lived SRV, so every packet finds something expired to purge.
+        GroupMdns.Cache f = new GroupMdns.Cache();
+        byte[] other = dnsName("_x", "_tcp", "local");
+        for (int i = 0; i < 3000; i++) {
+            byte[] n = dnsName("p" + i, "_x", "_tcp", "local");
+            byte[] p = dnsResponse(0x8400, rr(other, 12, 4000, n), rr(n, 33, 1, srvData(1, dnsName("h", "local"))));
+            f.handle(p, p.length, "10.0.0.1", i * 2000L);
+        }
+        int kept = f.look("_x._tcp.local", 6000000).found + f.look("_x._tcp.local", 6000000).gone;
+        check(kept <= 1024, "PTRs stay bounded while other records expire: " + kept);
+        // A long chain of backward pointers is refused rather than followed.
+        ByteArrayOutputStream chain = new ByteArrayOutputStream();
+        byte[] h0 = cat(u16(0), u16(0x8400), u16(0), u16(1), u16(0), u16(0));
+        chain.write(h0, 0, h0.length);
+        chain.write(1); chain.write('a'); chain.write(0);
+        for (int i = 0; i < 100; i++) {
+            int at = chain.size() - (i == 0 ? 3 : 2);
+            chain.write(0xc0 | at >> 8); chain.write(at);
+        }
+        byte[] ptrRec = rr(new byte[] {(byte) 0xc0, (byte) 12}, 12, 120, inst);
+        byte[] tail = cat(chain.toByteArray(), ptrRec);
+        new GroupMdns.Cache().handle(tail, tail.length, "10.0.0.1", 0); // must not throw
+        GroupMdns.Reader deep = new GroupMdns.Reader(tail, tail.length);
+        deep.pos = tail.length - ptrRec.length - 2;
+        try {
+            deep.name();
+            check(false, "a 100-pointer chain is followed");
+        } catch (IllegalArgumentException expected) {
+        }
+    }
+
+    /** Answers questions straight to the asker, PTR alone at first, as a legacy-query responder does. */
+    static MulticastSocket fakeResponder(int port) throws IOException {
+        InetAddress g = InetAddress.getByName(GroupMdns.GROUP);
+        MulticastSocket s = new MulticastSocket(new InetSocketAddress(g, port));
+        if (GroupMdns.join(s, g, port) == 0) s.joinGroup(g);
+        byte[] type = dnsName("_t", "_tcp", "local"), inst = dnsName("Fake Echo", "_t", "_tcp", "local");
+        byte[] host = dnsName("fake", "local");
+        DatagramSocket reply = new DatagramSocket(); // a socket bound to the group's address cannot send
+        pool.execute(() -> {
+            byte[] buf = new byte[1500];
+            while (!s.isClosed()) {
+                DatagramPacket p = new DatagramPacket(buf, buf.length);
+                try {
+                    s.receive(p);
+                    GroupMdns.Reader r = new GroupMdns.Reader(p.getData(), p.getLength());
+                    r.pos = 2;
+                    if ((r.u16() & 0x8000) != 0) continue;
+                    r.pos = 12;
+                    List<String> name = r.name();
+                    int t = r.u16();
+                    byte[] answer;
+                    if (t == 12 && name.get(0).equals("_t")) answer = rr(type, 12, 120, inst);
+                    else if (t == 33 && name.get(0).equals("Fake Echo")) answer = rr(inst, 33, 120, srvData(4242, host));
+                    else if (t == 16 && name.get(0).equals("Fake Echo")) answer = rr(inst, 16, 120, txtData("id=x"));
+                    else if (t == 1 && name.get(0).equals("fake")) answer = rr(host, 1, 120, aData(10, 9, 8, 7));
+                    else continue;
+                    byte[] out = dnsResponse(0x8400, answer);
+                    reply.send(new DatagramPacket(out, out.length, p.getAddress(), p.getPort()));
+                } catch (IOException | RuntimeException e) {
+                    if (s.isClosed()) break;
+                }
+            }
+            reply.close();
+        });
+        return s;
+    }
+
+    static final ThreadFactory DAEMONS = r -> {
+        Thread t = new Thread(r);
+        t.setDaemon(true);
+        return t;
+    };
+
+    static void groupMdnsLooks() throws Exception {
+        int port = 25353;
+        Mdns refuse = new Mdns() {
+            @Override public List<Service> browse(String type, long lookMs) throws IOException { throw new IOException("fell back"); }
+            @Override public Closeable advertise(String i, String t, int p, Map<String, String> txt) { return () -> {}; }
+        };
+        MulticastSocket responder = fakeResponder(port);
+        GroupMdns m = new GroupMdns(refuse, DAEMONS, GroupMdns.GROUP, port);
+        try {
+            check(!m.diagnostics().containsKey("listener"), "listening to the group: " + m.diagnostics());
+            List<Mdns.Service> found = m.browse("_t._tcp", 2500);
+            check(found.size() == 1, "found the responder's service: " + m.diagnostics());
+            Mdns.Service s = found.get(0);
+            check(s.instance.equals("Fake Echo") && s.address.equals("10.9.8.7") && s.port == 4242 && s.txt("id").equals("x"),
+                    "resolved through follow-up questions");
+            check(m.lastLookComplete("_t._tcp"), "the look is complete");
+            check(m.diagnostics().get("_t._tcp").equals("1 found, 1 resolved"), "diagnostics: " + m.diagnostics());
+            check(m.browse("_none._tcp", 600).isEmpty() && m.lastLookComplete("_none._tcp"), "nothing found is a complete look");
+        } finally {
+            m.close();
+            responder.close();
+        }
+        try {
+            m.browse("_t._tcp", 100);
+            check(false, "a closed listener looks no more");
+        } catch (IOException expected) {
+        }
+    }
+
+    static void groupMdnsFallsBack() throws Exception {
+        FakeMdns.ads.clear();
+        FakeMdns fake = new FakeMdns("10.0.0.1");
+        fake.advertise("Kept", "_t._tcp", 1, new LinkedHashMap<>());
+        GroupMdns m = new GroupMdns(fake, DAEMONS, "10.255.255.1", 25354);
+        try {
+            check(String.valueOf(m.diagnostics().get("listener")).contains("Android's mDNS service looks instead"), "says it fell back");
+            List<Mdns.Service> found = m.browse("_t._tcp", 10);
+            check(found.size() == 1 && found.get(0).instance.equals("Kept"), "looks through the fallback");
+        } finally {
+            m.close();
+            FakeMdns.ads.clear();
+        }
     }
 
     /** Sends request as is and returns whatever comes back before the server closes or goes quiet. */

@@ -1,6 +1,7 @@
 package dev.yancey.intercombridge;
 
 import android.content.Context;
+import android.net.wifi.WifiManager;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -30,7 +31,9 @@ public final class IntercomBridgePlugin implements KioskPlugin {
     private PluginHost host;
     private ExecutorService pool;
     private Runner runner;
-    private NsdMdns mdns;
+    private NsdMdns nsd;
+    private GroupMdns mdns;
+    private WifiManager.MulticastLock multicast;
     private Thread thread;
     private Map<String, Object> running; // the settings the runner was started with
 
@@ -91,7 +94,17 @@ public final class IntercomBridgePlugin implements KioskPlugin {
             @Override public void info(String m) { say(m); }
             @Override public void warn(String m) { say(m); }
         };
-        mdns = new NsdMdns(context);
+        // Without this lock, Wi-Fi may drop the mDNS group's packets before the bridge hears them.
+        try {
+            multicast = ((WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE))
+                    .createMulticastLock("intercom-bridge");
+            multicast.setReferenceCounted(false);
+            multicast.acquire();
+        } catch (RuntimeException e) {
+            multicast = null;
+        }
+        nsd = new NsdMdns(context);
+        mdns = new GroupMdns(nsd, daemons);
         runner = new Runner(cfg, mdns, pool, log, this::report, bridgeId(dir),
                 (int) num(settings, "statusPort", 8790), EVERY_MS);
         report("", "Looking for another bridge");
@@ -124,10 +137,16 @@ public final class IntercomBridgePlugin implements KioskPlugin {
         }
         pool.shutdownNow();
         mdns.close();
+        nsd.close();
+        if (multicast != null) {
+            try { multicast.release(); } catch (RuntimeException ignored) {}
+        }
         runner = null;
         thread = null;
         pool = null;
         mdns = null;
+        nsd = null;
+        multicast = null;
     }
 
     private void report(String level, String text) {
