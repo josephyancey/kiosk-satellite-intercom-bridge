@@ -59,6 +59,7 @@ public final class IntercomBridgeTest {
         groupMdnsHostile();
         groupMdnsLooks();
         groupMdnsFallsBack();
+        groupMdnsAnnounces();
         System.out.println("IntercomBridgeTest: all passed");
         System.exit(0);
     }
@@ -995,7 +996,7 @@ public final class IntercomBridgeTest {
             @Override public Closeable advertise(String i, String t, int p, Map<String, String> txt) { return () -> {}; }
         };
         MulticastSocket responder = fakeResponder(port);
-        GroupMdns m = new GroupMdns(refuse, DAEMONS, GroupMdns.GROUP, port);
+        GroupMdns m = new GroupMdns(refuse, DAEMONS, "", GroupMdns.GROUP, port, GroupMdns.ANNOUNCE_MS);
         try {
             check(!m.diagnostics().containsKey("listener"), "listening to the group: " + m.diagnostics());
             List<Mdns.Service> found = m.browse("_t._tcp", 2500);
@@ -1021,7 +1022,7 @@ public final class IntercomBridgeTest {
         FakeMdns.ads.clear();
         FakeMdns fake = new FakeMdns("10.0.0.1");
         fake.advertise("Kept", "_t._tcp", 1, new LinkedHashMap<>());
-        GroupMdns m = new GroupMdns(fake, DAEMONS, "10.255.255.1", 25354);
+        GroupMdns m = new GroupMdns(fake, DAEMONS, "", "10.255.255.1", 25354, GroupMdns.ANNOUNCE_MS);
         try {
             check(String.valueOf(m.diagnostics().get("listener")).contains("Android's mDNS service looks instead"), "says it fell back");
             List<Mdns.Service> found = m.browse("_t._tcp", 10);
@@ -1030,6 +1031,161 @@ public final class IntercomBridgeTest {
             m.close();
             FakeMdns.ads.clear();
         }
+    }
+
+    /** This machine's address on the network the group's packets go out on, which a responder here answers from. */
+    static String localAddress() throws IOException {
+        for (java.net.NetworkInterface nic : java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+            if (!nic.isUp() || nic.isLoopback() || !nic.supportsMulticast()) continue;
+            for (InetAddress a : java.util.Collections.list(nic.getInetAddresses())) {
+                if (a instanceof java.net.Inet4Address) return a.getHostAddress();
+            }
+        }
+        throw new IOException("no network to test on");
+    }
+
+    /**
+     * Answers questions for one stand-in as Android's mDNS service holds it: straight to the asker, from
+     * this machine's address, with a host name and TXT order of its own.
+     */
+    static MulticastSocket fakeAndroid(int port, byte[] txt) throws IOException {
+        InetAddress g = InetAddress.getByName(GroupMdns.GROUP);
+        MulticastSocket s = new MulticastSocket(new InetSocketAddress(g, port));
+        if (GroupMdns.join(s, g, port) == 0) s.joinGroup(g);
+        byte[] inst = dnsName("ks-590a2c66906c3acf", "_kiosk-satellite", "_tcp", "local");
+        byte[] host = dnsName("Android-Portal", "local");
+        DatagramSocket reply = new DatagramSocket();
+        pool.execute(() -> {
+            byte[] buf = new byte[1500];
+            while (!s.isClosed()) {
+                DatagramPacket p = new DatagramPacket(buf, buf.length);
+                try {
+                    s.receive(p);
+                    GroupMdns.Reader r = new GroupMdns.Reader(p.getData(), p.getLength());
+                    r.pos = 2;
+                    if ((r.u16() & 0x8000) != 0) continue;
+                    r.pos = 12;
+                    List<String> name = r.name();
+                    int t = r.u16();
+                    byte[] answer;
+                    if (t == 33 && name.get(0).equals("ks-590a2c66906c3acf")) answer = rr(inst, 33, 10, srvData(41006, host));
+                    else if (t == 16 && name.get(0).equals("ks-590a2c66906c3acf")) answer = rr(inst, 16, 10, txt);
+                    else if (t == 1 && name.get(0).equalsIgnoreCase("Android-Portal")) answer = rr(host, 1, 10, aData(10, 9, 8, 7));
+                    else continue;
+                    byte[] out = dnsResponse(0x8400, answer);
+                    reply.send(new DatagramPacket(out, out.length, p.getAddress(), p.getPort()));
+                } catch (IOException | RuntimeException e) {
+                    if (s.isClosed()) break;
+                }
+            }
+            reply.close();
+        });
+        return s;
+    }
+
+    /** Waits up to ms for the group's responses, feeding each to heard until done says so; the number heard. */
+    static int hearResponses(MulticastSocket hear, GroupMdns.Cache heard, long ms, int port, int[] fromPort,
+            List<byte[]> packets, java.util.function.BooleanSupplier done) throws IOException {
+        int n = 0;
+        long until = System.currentTimeMillis() + ms;
+        byte[] buf = new byte[9000];
+        while (System.currentTimeMillis() < until && (done == null || !done.getAsBoolean())) {
+            DatagramPacket p = new DatagramPacket(buf, buf.length);
+            try {
+                hear.receive(p);
+            } catch (java.net.SocketTimeoutException quiet) {
+                continue;
+            }
+            if ((buf[2] & 0x80) == 0) continue; // questions
+            n++;
+            if (fromPort != null && p.getPort() == port) fromPort[0]++;
+            if (packets != null) packets.add(Arrays.copyOf(p.getData(), p.getLength()));
+            heard.handle(p.getData(), p.getLength(), "10.0.0.250", System.currentTimeMillis());
+        }
+        return n;
+    }
+
+    static boolean contains(byte[] hay, byte[] needle) {
+        outer:
+        for (int i = 0; i + needle.length <= hay.length; i++) {
+            for (int j = 0; j < needle.length; j++) if (hay[i + j] != needle[j]) continue outer;
+            return true;
+        }
+        return false;
+    }
+
+    static void groupMdnsAnnounces() throws Exception {
+        int port = 25356;
+        InetAddress g = InetAddress.getByName(GroupMdns.GROUP);
+        MulticastSocket hear = new MulticastSocket(new InetSocketAddress(g, port));
+        if (GroupMdns.join(hear, g, port) == 0) hear.joinGroup(g);
+        hear.setSoTimeout(200);
+        byte[] androidTxt = txtData("name=Gen2 Echo", "id=590a2c66906c3acf", "standin=1");
+        MulticastSocket android = fakeAndroid(port, androidTxt);
+        boolean[] unregistered = new boolean[1];
+        Mdns nsd = new Mdns() {
+            @Override public List<Service> browse(String type, long lookMs) { return new ArrayList<>(); }
+            @Override public Closeable advertise(String i, String t, int p, Map<String, String> txt) { return () -> unregistered[0] = true; }
+        };
+        GroupMdns m = new GroupMdns(nsd, DAEMONS, localAddress(), GroupMdns.GROUP, port, 400);
+        String domain = "_kiosk-satellite._tcp.local";
+        GroupMdns.Cache heard = new GroupMdns.Cache();
+        try {
+            Map<String, String> txt = new LinkedHashMap<>();
+            txt.put("id", "590a2c66906c3acf");
+            Closeable ad = m.advertise("ks-590a2c66906c3acf", "_kiosk-satellite._tcp", 41006, txt);
+            int[] fromPort = new int[1];
+            List<byte[]> packets = new ArrayList<>();
+            // The first a couple of seconds on, once Android's service answered; then every 1.4 s (400 ms and the wait).
+            int announcements = hearResponses(hear, heard, 5500, port, fromPort, packets, null);
+            check(announcements >= 3, "announced, and again on the timer: " + announcements + "; " + m.diagnostics());
+            check(fromPort[0] == announcements, "from the mDNS port, as responders expect: " + fromPort[0] + " of " + announcements);
+            GroupMdns.Cache.Look look = heard.look(domain, System.currentTimeMillis());
+            check(look.services.size() == 1 && look.complete == 1, "PTR, SRV, TXT and A in each: " + look.found);
+            Mdns.Service s = look.services.get(0);
+            check(s.instance.equals("ks-590a2c66906c3acf") && s.address.equals("10.9.8.7") && s.port == 41006
+                    && s.txt("name").equals("Gen2 Echo"), "the stand-in as Android's service holds it");
+            for (byte[] p : packets) {
+                check(contains(p, androidTxt) && contains(p, dnsName("Android-Portal", "local")),
+                        "Android's TXT bytes and SRV target, exactly, so its service sees no conflict");
+            }
+            check(String.valueOf(m.diagnostics().get("announcing")).startsWith("every 0 s, 1 now"), "status: " + m.diagnostics());
+
+            ad.close();
+            check(unregistered[0], "Android's registration is closed too");
+            hearResponses(hear, heard, 1500, port, null, null, () -> heard.look(domain, System.currentTimeMillis()).found == 0);
+            check(heard.look(domain, System.currentTimeMillis()).found == 0, "a goodbye when it is closed");
+            check(hearResponses(hear, heard, 1600, port, null, null, null) == 0, "silent once closed");
+
+            // Closing the whole listener says goodbye for what is still advertised.
+            m.advertise("ks-590a2c66906c3acf", "_kiosk-satellite._tcp", 41006, txt);
+            hearResponses(hear, heard, 3000, port, null, null, () -> heard.look(domain, System.currentTimeMillis()).found == 1);
+            check(heard.look(domain, System.currentTimeMillis()).found == 1, "announced again");
+            m.close();
+            hearResponses(hear, heard, 1500, port, null, null, () -> heard.look(domain, System.currentTimeMillis()).found == 0);
+            check(heard.look(domain, System.currentTimeMillis()).found == 0, "goodbyes on close");
+        } finally {
+            m.close();
+            hear.close();
+            android.close();
+        }
+
+        // Never announced while Android's service has not answered, so nothing it could take for a conflict.
+        GroupMdns quiet = new GroupMdns(nsd, DAEMONS, "10.255.255.254", GroupMdns.GROUP, port + 1, 300);
+        MulticastSocket hear2 = new MulticastSocket(new InetSocketAddress(g, port + 1));
+        if (GroupMdns.join(hear2, g, port + 1) == 0) hear2.joinGroup(g);
+        hear2.setSoTimeout(200);
+        try {
+            quiet.advertise("ks-unanswered", "_kiosk-satellite._tcp", 1, new LinkedHashMap<>());
+            check(hearResponses(hear2, new GroupMdns.Cache(), 3000, port + 1, null, null, null) == 0, "nothing announced unanswered");
+            check(String.valueOf(quiet.diagnostics().get("announcing")).contains("did not answer"), "says why: " + quiet.diagnostics());
+        } finally {
+            quiet.close();
+            hear2.close();
+        }
+        check(GroupMdns.ipv4("10.1.3.148") != null && GroupMdns.ipv4("10.1.3") == null && GroupMdns.ipv4("10.1.3.256") == null
+                && GroupMdns.ipv4("a.b.c.d") == null && GroupMdns.ipv4("") == null, "only dotted IPv4 addresses");
+        System.out.println("announces ok");
     }
 
     /** Sends request as is and returns whatever comes back before the server closes or goes quiet. */

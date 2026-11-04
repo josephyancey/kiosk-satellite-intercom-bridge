@@ -20,7 +20,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Looks for services by listening to mDNS itself, the way Kiosk Satellite finds its fleet, rather than
@@ -31,6 +33,12 @@ import java.util.concurrent.ThreadFactory;
  * takes a reply sent straight to the device's mDNS port, which is Android's or Kiosk Satellite's. Queries
  * go out from a port of its own, where responders send their answers straight back. Advertising stays
  * with the given Mdns, which also does the looking if the group cannot be joined.
+ *
+ * What it advertises it also announces to the group itself, every ANNOUNCE_MS, as Kiosk Satellite does:
+ * Kiosk Satellite drops a kiosk it has not heard from in 100 seconds, and Android's mDNS service
+ * announces a service once, when it is registered, and after that only answers questions. The records
+ * announced are the ones Android's service gives when asked, byte for byte: it holds the same names,
+ * and would take any other SRV or TXT for them as a conflict and rename the service.
  */
 final class GroupMdns implements Mdns {
     static final String GROUP = "224.0.0.251";
@@ -38,6 +46,9 @@ final class GroupMdns implements Mdns {
     private static final int TYPE_A = 1, TYPE_PTR = 12, TYPE_TXT = 16, TYPE_SRV = 33, CLASS_IN = 1;
     private static final long FOLLOW_UP_MS = 500; // how often a look asks for what it still lacks
     private static final long ASK_AGAIN_MS = 1000; // the soonest the same question goes out again
+    static final long ANNOUNCE_MS = 30000; // three chances inside Kiosk Satellite's 100 seconds
+    static final int RECORD_TTL = 4500, HOST_TTL = 120; // Kiosk Satellite's, the mDNS conventions
+    private static final long ANSWER_MS = 1000; // how long Android's service has to answer before an announcement
 
     private final Mdns fallback;
     private final InetAddress group;
@@ -49,14 +60,27 @@ final class GroupMdns implements Mdns {
     private MulticastSocket listen, ask;
     private String notListening = ""; // why looks go through the fallback, when they do
     private boolean closed;
+    private final String self; // this device's address, which Android's service answers from
+    private final long announceMs;
+    private final ScheduledThreadPoolExecutor announcer;
+    private final Map<Ad, Boolean> ads = new ConcurrentHashMap<>();
+    private volatile String announced = ""; // how the last announcement went, for the status page
 
-    GroupMdns(Mdns fallback, ThreadFactory threads) {
-        this(fallback, threads, GROUP, PORT);
+    GroupMdns(Mdns fallback, ThreadFactory threads, String address) {
+        this(fallback, threads, address, GROUP, PORT, ANNOUNCE_MS);
     }
 
-    GroupMdns(Mdns fallback, ThreadFactory threads, String group, int port) {
+    GroupMdns(Mdns fallback, ThreadFactory threads, String address, String group, int port, long announceMs) {
         this.fallback = fallback;
         this.port = port;
+        this.announceMs = announceMs;
+        this.self = address == null ? "" : address.trim();
+        announcer = new ScheduledThreadPoolExecutor(1, threads);
+        announcer.scheduleWithFixedDelay(() -> {
+            for (Ad ad : ads.keySet()) ask(ad);
+            sleepQuietly(ANSWER_MS);
+            for (Ad ad : ads.keySet()) announce(ad);
+        }, announceMs, announceMs, TimeUnit.MILLISECONDS);
         InetAddress g = null;
         try {
             g = InetAddress.getByName(group);
@@ -130,6 +154,12 @@ final class GroupMdns implements Mdns {
         closed = true;
         close(listen);
         close(ask);
+        // Goodbyes for what is still advertised: the periodic announcement ends, but they still go.
+        for (Ad ad : new ArrayList<>(ads.keySet())) {
+            ads.remove(ad);
+            goodbye(ad);
+        }
+        announcer.shutdown();
     }
 
     private synchronized boolean listening() {
@@ -203,17 +233,185 @@ final class GroupMdns implements Mdns {
 
     @Override
     public Map<String, Object> diagnostics() {
-        if (!listening()) {
-            Map<String, Object> d = new LinkedHashMap<>(fallback.diagnostics());
-            if (!notListening.isEmpty()) d.put("listener", notListening);
-            return d;
+        Map<String, Object> d = new LinkedHashMap<>(listening() ? looks : fallback.diagnostics());
+        if (!listening() && !notListening.isEmpty()) d.put("listener", notListening);
+        if (!announced.isEmpty()) d.put("announcing", announced);
+        return d;
+    }
+
+    /** One service advertised here, as announced to the group. */
+    static final class Ad {
+        final String instance, type;
+        final int port;
+        final List<String> full; // its name's labels
+        volatile byte[] goodbye; // ends what was last announced, once anything was
+
+        Ad(String instance, String type, int port) {
+            this.instance = instance;
+            this.type = type;
+            this.port = port;
+            full = new ArrayList<>();
+            full.add(instance);
+            full.addAll(Cache.labels(type + ".local"));
         }
-        return new LinkedHashMap<>(looks);
     }
 
     @Override
     public Closeable advertise(String instance, String type, int port, Map<String, String> txt) throws IOException {
-        return fallback.advertise(instance, type, port, txt);
+        Closeable registered = fallback.advertise(instance, type, port, txt); // so questions are answered too
+        Ad ad = new Ad(instance, type, port);
+        ads.put(ad, true);
+        // Android's service announced it on registering; the first of these follows a few seconds on.
+        try {
+            announcer.execute(() -> ask(ad));
+            announcer.schedule(() -> announce(ad), ANSWER_MS * 2, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException shutDown) {
+            // Closed already: nothing more is announced.
+        }
+        return () -> {
+            boolean was = ads.remove(ad) != null;
+            registered.close(); // Android's goodbye first, so its service does not defend the name against ours
+            if (was) goodbye(ad);
+        };
+    }
+
+    /** Asks Android's service for ad's SRV and TXT, and its host's address, which come back to this listener. */
+    private void ask(Ad ad) {
+        if (!listening()) return;
+        String full = ad.instance + "." + ad.type + ".local";
+        try {
+            send(question(full, TYPE_SRV));
+            send(question(full, TYPE_TXT));
+            Cache.Held h = cache.held(ad.full, self, System.currentTimeMillis());
+            if (h != null) send(question(String.join(".", h.target), TYPE_A));
+        } catch (IOException e) {
+            announced = "asking for " + ad.instance + " failed: " + e.getMessage();
+        }
+    }
+
+    /** Announces ad's records as Android's service last gave them; nothing until it has. */
+    private void announce(Ad ad) {
+        if (!ads.containsKey(ad)) return;
+        Cache.Held h = cache.held(ad.full, self, System.currentTimeMillis());
+        if (h == null || h.port != ad.port) {
+            announced = "Android's mDNS service did not answer for " + ad.instance;
+            return;
+        }
+        ad.goodbye = response(ad, h, 0, 0);
+        sendResponse(response(ad, h, RECORD_TTL, HOST_TTL), ad.instance);
+    }
+
+    /** A goodbye, sent from the announcer's thread, since the caller's may be one that must not use the network. */
+    private void goodbye(Ad ad) {
+        byte[] p = ad.goodbye;
+        if (p == null) return; // never announced here; Android's service says its own goodbye
+        try {
+            announcer.execute(() -> sendResponse(p, ad.instance));
+        } catch (RuntimeException shutDown) {
+            // Android's service still says its own.
+        }
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Sends a response to the group from the mDNS port, as responders expect of one. The socket is held
+     * only for the send, so a reply sent straight to the device's mDNS port is not taken from Android or
+     * Kiosk Satellite; when the port cannot be had, it goes from a port of its own.
+     */
+    private void sendResponse(byte[] p, String what) {
+        if (group == null) return;
+        DatagramPacket packet = new DatagramPacket(p, p.length, group, port);
+        String every = "every " + announceMs / 1000 + " s, " + ads.size() + " now";
+        try (MulticastSocket s = new MulticastSocket(null)) {
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress(port));
+            s.setTimeToLive(255);
+            s.send(packet);
+            announced = every;
+        } catch (IOException | RuntimeException fromPort) {
+            try (MulticastSocket s = new MulticastSocket(0)) {
+                s.setTimeToLive(255);
+                s.send(packet);
+                // Most responders ignore a response from any port but 5353; Kiosk Satellite takes it.
+                announced = every + ", from a port of its own, so only kiosks heed them (" + fromPort.getMessage() + ")";
+            } catch (IOException | RuntimeException e) {
+                announced = "announcing " + what + " failed: " + e.getMessage();
+            }
+        }
+    }
+
+    /** An unsolicited response with ad's PTR, SRV and TXT as held, and its host's address unless it is a goodbye. */
+    static byte[] response(Ad ad, Cache.Held h, int ttl, int hostTtl) {
+        boolean withAddress = h.address != null && hostTtl > 0;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        u16(out, 0);
+        u16(out, 0x8400); // an authoritative response
+        u16(out, 0);
+        u16(out, withAddress ? 4 : 3);
+        u16(out, 0);
+        u16(out, 0);
+        List<String> full = ad.full;
+        // The PTR is shared, so without the cache-flush bit; the rest are this device's alone.
+        record(out, Cache.labels(ad.type + ".local"), TYPE_PTR, CLASS_IN, ttl, name(full));
+        ByteArrayOutputStream srv = new ByteArrayOutputStream();
+        u16(srv, h.priority);
+        u16(srv, h.weight);
+        u16(srv, h.port);
+        byte[] target = name(h.target);
+        srv.write(target, 0, target.length);
+        record(out, full, TYPE_SRV, 0x8000 | CLASS_IN, hostTtl, srv.toByteArray());
+        record(out, full, TYPE_TXT, 0x8000 | CLASS_IN, ttl, h.txt);
+        if (withAddress) record(out, h.target, TYPE_A, 0x8000 | CLASS_IN, hostTtl, h.address);
+        return out.toByteArray();
+    }
+
+    private static void record(ByteArrayOutputStream out, List<String> name, int type, int cls, long ttl, byte[] data) {
+        byte[] n = name(name);
+        out.write(n, 0, n.length);
+        u16(out, type);
+        u16(out, cls);
+        u16(out, (int) (ttl >> 16));
+        u16(out, (int) ttl);
+        u16(out, data.length);
+        out.write(data, 0, data.length);
+    }
+
+    private static byte[] name(List<String> labels) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (String l : labels) {
+            byte[] b = l.getBytes(StandardCharsets.UTF_8);
+            out.write(Math.min(b.length, 63));
+            out.write(b, 0, Math.min(b.length, 63));
+        }
+        out.write(0);
+        return out.toByteArray();
+    }
+
+    private static void u16(ByteArrayOutputStream out, int v) {
+        out.write(v >> 8 & 255);
+        out.write(v & 255);
+    }
+
+    /** The four bytes of a dotted IPv4 address, or null for anything else. */
+    static byte[] ipv4(String a) {
+        if (a == null) return null;
+        String[] parts = a.trim().split("\\.", -1);
+        if (parts.length != 4) return null;
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            if (!parts[i].matches("[0-9]{1,3}")) return null;
+            int v = Integer.parseInt(parts[i]);
+            if (v > 255) return null;
+            out[i] = (byte) v;
+        }
+        return out;
     }
 
     /**
@@ -226,9 +424,10 @@ final class GroupMdns implements Mdns {
         static final long GONE_MS = 10000; // asked this long for an instance's port, unanswered, it has gone
 
         private static final class Ptr { final String instance; final long until; Ptr(String i, long u) { instance = i; until = u; } }
-        private static final class Srv { final String target, from; final int port; final long until;
-            Srv(String t, int p, String f, long u) { target = t; port = p; from = f; until = u; } }
-        private static final class Txt { final Map<String, String> txt; final long until; Txt(Map<String, String> t, long u) { txt = t; until = u; } }
+        private static final class Srv { final String target, from; final int port, priority, weight; final List<String> heard; final long until;
+            Srv(String t, int p, String f, long u, int pr, int w, List<String> h) { target = t; port = p; from = f; until = u; priority = pr; weight = w; heard = h; } }
+        private static final class Txt { final Map<String, String> txt; final byte[] raw; final long until;
+            Txt(Map<String, String> t, byte[] r, long u) { txt = t; raw = r; until = u; } }
         private static final class A { final String address; final long until; A(String a, long u) { address = a; until = u; } }
 
         private final Map<String, Map<String, Ptr>> ptrs = new HashMap<>(); // domain to instance name to record
@@ -314,15 +513,16 @@ final class GroupMdns implements Mdns {
                 m.put(instance, new Ptr(target.get(0), until));
                 unanswered.remove(instance); // only the device itself sends its PTR, so it is back
             } else if (type == TYPE_SRV) {
-                r.skip(4); // priority and weight
+                int priority = r.u16(), weight = r.u16();
                 int port = r.u16();
-                String target = key(r.name());
+                List<String> heard = r.name();
+                String target = key(heard);
                 if (bye) {
                     // A goodbye ends only the record it names, not one for a port taken since.
                     Srv old = srvs.get(key);
                     if (old != null && old.port == port && old.target.equals(target)) srvs.remove(key);
                 } else if (room(srvs, key, now)) {
-                    srvs.put(key, new Srv(target, port, from, until));
+                    srvs.put(key, new Srv(target, port, from, until, priority, weight, heard));
                     unanswered.remove(key);
                 }
             } else if (type == TYPE_TXT) {
@@ -342,7 +542,7 @@ final class GroupMdns implements Mdns {
                     Txt old = txts.get(key);
                     if (old != null && old.txt.equals(txt)) txts.remove(key);
                 } else if (room(txts, key, now)) {
-                    txts.put(key, new Txt(txt, until));
+                    txts.put(key, new Txt(txt, java.util.Arrays.copyOfRange(data, start, start + len), until));
                 }
             } else if (type == TYPE_A && len == 4) {
                 String a = (data[start] & 255) + "." + (data[start + 1] & 255) + "." + (data[start + 2] & 255) + "." + (data[start + 3] & 255);
@@ -416,6 +616,36 @@ final class GroupMdns implements Mdns {
             return out;
         }
 
+        /** An instance's records as one responder holds them, to be repeated exactly. */
+        static final class Held {
+            final int priority, weight, port;
+            final List<String> target;
+            final byte[] txt, address;
+
+            Held(int priority, int weight, int port, List<String> target, byte[] txt, byte[] address) {
+                this.priority = priority;
+                this.weight = weight;
+                this.port = port;
+                this.target = target;
+                this.txt = txt;
+                this.address = address;
+            }
+        }
+
+        /**
+         * The SRV and TXT of the instance full (its labels), and its host's address, as heard from the
+         * address from, all still current; null when any of the SRV or TXT is missing, stale or another's.
+         */
+        synchronized Held held(List<String> full, String from, long now) {
+            String key = key(full);
+            Srv s = srvs.get(key);
+            Txt t = txts.get(key);
+            if (s == null || t == null || s.until <= now || t.until <= now || !s.from.equals(from)) return null;
+            A a = as.get(s.target);
+            byte[] address = a == null || a.until <= now ? null : ipv4(a.address);
+            return new Held(s.priority, s.weight, s.port, s.heard, t.raw, address);
+        }
+
         /** The questions that would fill in what the instances of domain still lack, as {name, type}. */
         synchronized List<String[]> missing(String domain, long now) {
             List<String[]> out = new ArrayList<>();
@@ -473,7 +703,7 @@ final class GroupMdns implements Mdns {
             return out.toByteArray();
         }
 
-        private static List<String> labels(String name) {
+        static List<String> labels(String name) {
             List<String> out = new ArrayList<>();
             for (String l : name.split("\\.")) if (!l.isEmpty()) out.add(l);
             return out;

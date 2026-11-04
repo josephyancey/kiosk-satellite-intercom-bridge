@@ -25,7 +25,7 @@ import me.jxl.kiosk.plugins.PluginHost;
  * the network at a time, and another takes over when it stops.
  */
 public final class IntercomBridgePlugin implements KioskPlugin {
-    static final String VERSION = "1.0.2";
+    static final String VERSION = "1.0.3";
     private static final long EVERY_MS = 30000;
 
     private PluginHost host;
@@ -104,7 +104,7 @@ public final class IntercomBridgePlugin implements KioskPlugin {
             multicast = null;
         }
         nsd = new NsdMdns(context);
-        mdns = new GroupMdns(nsd, daemons);
+        mdns = new GroupMdns(nsd, daemons, cfg.advertise);
         runner = new Runner(cfg, mdns, pool, log, this::report, bridgeId(dir),
                 (int) num(settings, "statusPort", 8790), EVERY_MS);
         report("", "Looking for another bridge");
